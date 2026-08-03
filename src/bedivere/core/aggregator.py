@@ -43,7 +43,8 @@ def aggregate_candles(
 ) -> list[Candle]:
     """Aggregates 15-minute close-stamped candles into the target timeframe
     using the handed-over session-day boundaries. Output is close-stamped at
-    the LAST underlying bar of each bucket (NT8 display convention)."""
+    the LAST underlying bar of each bucket — the convention charting
+    platforms use for displayed HTF bars."""
     if target_timeframe == Timeframe.D1:
         raise ValueError(
             'aggregate_candles: target "1d" is not supported by the intraday aggregator — daily bars are session rollups, out of scope here.'

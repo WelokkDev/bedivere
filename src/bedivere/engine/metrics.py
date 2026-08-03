@@ -1,4 +1,7 @@
-"""Trade statistics — honest aggregates over completed trades.
+"""Run-level metrics — honest aggregates over completed trades.
+
+Kept OUT of Portfolio on purpose: the portfolio owns trading state, this
+owns interpretation, and interpretation changes far more often than state.
 
 Ratios that are undefined stay None: a run with no losing trades has no
 profit factor, not an infinite one; a run with no trades has no win rate,
@@ -15,8 +18,8 @@ from bedivere.core.pricing import InstrumentSpec
 from bedivere.engine.portfolio import TradeRecord
 
 
-def compute_stats(trades: list[TradeRecord], spec: InstrumentSpec) -> dict[str, object]:
-    """Aggregate stats for one run's trade list. Deterministic; all fields
+def compute_metrics(trades: list[TradeRecord], spec: InstrumentSpec) -> dict[str, object]:
+    """Aggregate metrics for one run's trade list. Deterministic; all fields
     JSON-serializable. Sums are exact int cents; ratios are rounded floats
     or None where undefined."""
     n = len(trades)

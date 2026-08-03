@@ -170,7 +170,7 @@ def main() -> None:
         journal_context={"example": "sma_cross"},
     )
     out = run.write("runs/sma-demo")
-    print(json.dumps({k: run.result[k] for k in ("summary", "stats", "strategy", "paramsHash", "resultHash")}, indent=2))
+    print(json.dumps({k: run.result[k] for k in ("summary", "metrics", "strategy", "paramsHash", "resultHash")}, indent=2))
     print(f"\narchived to {out}/ — run me again and compare resultHash.")
 
 

@@ -1,10 +1,10 @@
-"""bedivere.stats — aggregates are honest: undefined ratios stay None."""
+"""bedivere.engine.metrics — aggregates are honest: undefined ratios stay None."""
 
 from __future__ import annotations
 
 from bedivere.core.pricing import spec_from_handoff
+from bedivere.engine.metrics import compute_metrics
 from bedivere.engine.portfolio import TradeRecord
-from bedivere.stats import compute_stats
 
 SPEC = spec_from_handoff("DEMO", 0.25, 20)  # tick = 500 cents
 
@@ -31,13 +31,13 @@ def _trade(net_cents: int, *, risk_ticks: int | None = None, ambiguous: bool = F
 
 
 def test_empty_run_has_no_fake_numbers() -> None:
-    s = compute_stats([], SPEC)
-    assert s["trades"] == 0
-    assert s["winRate"] is None  # not 0.0 — undefined
-    assert s["profitFactor"] is None
-    assert s["avgTradeNetCents"] is None
-    assert s["maxDrawdownCents"] == 0
-    r = s["rMultiples"]
+    m = compute_metrics([], SPEC)
+    assert m["trades"] == 0
+    assert m["winRate"] is None  # not 0.0 — undefined
+    assert m["profitFactor"] is None
+    assert m["avgTradeNetCents"] is None
+    assert m["maxDrawdownCents"] == 0
+    r = m["rMultiples"]
     assert isinstance(r, dict) and r["known"] == 0 and r["avg"] is None
 
 
@@ -48,19 +48,19 @@ def test_mixed_run_aggregates() -> None:
         _trade(0),  # flat, no risk recorded
         _trade(250),  # W
     ]
-    s = compute_stats(trades, SPEC)
-    assert (s["wins"], s["losses"], s["flat"]) == (2, 1, 1)
-    assert s["winRate"] == 0.5
-    assert s["netCents"] == 750
-    assert s["grossProfitCents"] == 1250
-    assert s["grossLossCents"] == 500
-    assert s["profitFactor"] == 2.5
+    m = compute_metrics(trades, SPEC)
+    assert (m["wins"], m["losses"], m["flat"]) == (2, 1, 1)
+    assert m["winRate"] == 0.5
+    assert m["netCents"] == 750
+    assert m["grossProfitCents"] == 1250
+    assert m["grossLossCents"] == 500
+    assert m["profitFactor"] == 2.5
     # Equity path 1000 → 500 → 500 → 750: worst peak-to-trough is 500.
-    assert s["maxDrawdownCents"] == 500
-    assert s["longestWinStreak"] == 1
-    assert s["longestLossStreak"] == 1
-    assert s["ambiguousFills"] == 1
-    r = s["rMultiples"]
+    assert m["maxDrawdownCents"] == 500
+    assert m["longestWinStreak"] == 1
+    assert m["longestLossStreak"] == 1
+    assert m["ambiguousFills"] == 1
+    r = m["rMultiples"]
     assert isinstance(r, dict)
     assert r["known"] == 2
     assert r["avg"] == 0.125
@@ -69,6 +69,6 @@ def test_mixed_run_aggregates() -> None:
 
 
 def test_no_losses_means_no_profit_factor() -> None:
-    s = compute_stats([_trade(100), _trade(200)], SPEC)
-    assert s["profitFactor"] is None  # not infinity, not a big number
-    assert s["longestWinStreak"] == 2
+    m = compute_metrics([_trade(100), _trade(200)], SPEC)
+    assert m["profitFactor"] is None  # not infinity, not a big number
+    assert m["longestWinStreak"] == 2

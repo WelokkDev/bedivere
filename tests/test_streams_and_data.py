@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 
 from bedivere.core.types import Timeframe
-from bedivere.data import load_candles_csv, parse_timestamp
-from bedivere.streams import ReplayStream
+from bedivere.data.csv import load_candles_csv, parse_timestamp
+from bedivere.streams.replay import ReplayStream
 from tests.helpers import bar
 
 

@@ -1,4 +1,4 @@
-"""Bar loading — the one place unruly external data gets disciplined.
+"""CSV bar loading — the one place unruly external data gets disciplined.
 
 `load_candles_csv` reads a header-carrying CSV into close-stamped Candles:
 sorted ascending, duplicate timestamps refused. Timestamps may be unix
@@ -11,6 +11,10 @@ instant (a 5-minute bar covering 18:00:00–18:04:59 is stamped 18:05:00).
 Many exports stamp the OPEN. If yours does, shift by the bar period as you
 load — feeding open-stamped bars unshifted silently misaligns every
 session boundary and HTF bucket downstream.
+
+Loaders for other backends (a database, a broker export) belong beside
+this one in bedivere/data/ — the contract is simply "return clean
+Candles"; the streams and the engine never fetch data themselves.
 """
 
 from __future__ import annotations

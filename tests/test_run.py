@@ -19,7 +19,8 @@ from bedivere.core.types import Candle, Timeframe
 from bedivere.engine.intents import BracketIntent, OrderEvent
 from bedivere.engine.loop import RunContext
 from bedivere.engine.warmup import WarmupError, WarmupRequirement
-from bedivere.run import BacktestRun, run_backtest
+from bedivere.run.backtest import run_backtest
+from bedivere.run.record import RunRecord
 from bedivere.sessions import cme_futures_sessions
 from tests.helpers import bar
 
@@ -92,7 +93,7 @@ class OneShotLong:
         return {"entered": self.entered, "blockedWhileOpen": self.blocked}
 
 
-def _run(tmp_path: Path | None = None) -> BacktestRun:
+def _run(tmp_path: Path | None = None) -> RunRecord:
     if tmp_path is not None:
         tmp_path.mkdir(parents=True, exist_ok=True)
     return run_backtest(
@@ -135,8 +136,8 @@ def test_the_one_trade_is_exactly_as_constructed() -> None:
 
     summary: Any = run.result["summary"]
     assert summary["trades"] == 1 and summary["wins"] == 1
-    stats: Any = run.result["stats"]
-    assert stats["rMultiples"]["known"] == 1
+    metrics: Any = run.result["metrics"]
+    assert metrics["rMultiples"]["known"] == 1
     strategy_summary: Any = run.result["strategy"]
     assert strategy_summary["entered"] is True
 

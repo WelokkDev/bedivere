@@ -149,7 +149,9 @@ def run_loop(
 
         ctx = RunContext(
             bar=event.candle,
-            event_received_ms=event.ts * 1000,
+            event_received_ms=(
+                event.received_at_ms if event.received_at_ms is not None else event.ts * 1000
+            ),
             view=view,
             registry=registry,
             portfolio=portfolio,

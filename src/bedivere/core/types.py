@@ -9,14 +9,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Literal
-
-ZoneType = Literal["supply", "demand"]
 
 
 @dataclass(frozen=True, slots=True)
 class Candle:
-    """Close-stamped OHLCV bar (unix seconds, NT8 convention).
+    """Close-stamped OHLCV bar (unix seconds).
 
     `timestamp` is the CLOSE of the bar, not the open: a 15-minute bar
     covering 18:00:00-18:14:59 ET is stamped 18:15:00.

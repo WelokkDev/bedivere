@@ -1,9 +1,9 @@
-"""ReplayStream — bring-your-own-bars, served as BarEvents.
+"""ReplayStream — the backtest BarStream: bring-your-own-bars, replayed.
 
 bedivere deliberately has no data-fetching layer: how bars reach you (CSV,
 a database, a broker export) is your business. This stream takes an
-in-memory list of close-stamped Candles and replays them; `backfill` is
-always False in replay.
+in-memory list of close-stamped Candles and replays them as BarEvents;
+`backfill` is always False in replay.
 
 The constructor VALIDATES ordering rather than mending it: bars must be
 strictly ascending by timestamp. Sorting is data preparation and belongs at

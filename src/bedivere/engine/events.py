@@ -63,6 +63,10 @@ class BarEvent:
     # Live-feed replay/backfill bars are marked so decision code can skip
     # them (feed hygiene); replay streams always emit False.
     backfill: bool = False
+    # When the process RECEIVED this bar (unix ms). Live streams stamp it at
+    # arrival — the honest latency measurement; None (replay) means the
+    # close instant stands in for it.
+    received_at_ms: int | None = None
 
     def __post_init__(self) -> None:
         if self.ts != self.candle.timestamp:
