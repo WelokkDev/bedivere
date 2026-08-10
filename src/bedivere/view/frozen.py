@@ -34,8 +34,8 @@ __all__ = [
 class FrozenView:
     # Entry-TF bars with timestamp <= asOf.
     primary: list[Candle]
-    # Per HTF: bars whose bucket CLOSED at <= asOf — the only bars safe for
-    # zone detection.
+    # Per HTF: bars whose bucket CLOSED at <= asOf — the only bars a signal
+    # may read, since a forming bar can still change.
     completed: dict[Timeframe, list[Candle]]
     # Per HTF: `completed` plus a trailing forming bar (NOT flagged partial).
     as_of_view: dict[Timeframe, list[Candle]]
@@ -44,7 +44,7 @@ class FrozenView:
 def _reject_daily(tf: Timeframe, fn: str) -> None:
     if tf == Timeframe.D1:
         raise ValueError(
-            f'{fn}: "1d" is out of scope — daily bars are session rollups, not intraday buckets. Pass a subset of 15m/30m/1h/2h/4h.'
+            f'{fn}: "1d" is out of scope — daily bars are session rollups, not intraday buckets. Pass a subset of 1s/15s/5m/15m/30m/1h/2h/4h.'
         )
 
 

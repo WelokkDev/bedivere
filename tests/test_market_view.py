@@ -213,3 +213,55 @@ def test_no_factory_means_none_payloads() -> None:
         ts = start + (i + 1) * 300
         for close in view.update(bar(ts, 1, 2, 0.5, 1.5)):
             assert close.payload is None
+
+
+def test_forming_period_end_is_the_stamp_the_open_bucket_will_close_at() -> None:
+    view = MarketView(base_tf=Timeframe.M5, derived_tfs=[Timeframe.M30], days=DAYS2)
+    start = et("2026-07-14T18:00:00")
+
+    assert view.forming_period_end(Timeframe.M30) is None  # nothing open yet
+
+    # Five 5m bars into a 30m bucket: the stamp is known from the first bar
+    # and does not drift as the bucket fills.
+    for i in range(5):
+        view.update(bar(start + (i + 1) * 300, 1, 2, 0.5, 1.5, v=1))
+        assert view.forming_period_end(Timeframe.M30) == start + 1800
+
+    # The sixth bar COMPLETES the bucket, and the successor does not exist
+    # until the next base bar arrives — a bucket cannot be decided before it
+    # has begun.
+    closes = view.update(bar(start + 1800, 1, 2, 0.5, 1.5, v=1))
+    assert [c.tf for c in closes] == [Timeframe.M30]
+    assert view.forming_period_end(Timeframe.M30) is None
+
+    view.update(bar(start + 2100, 1, 2, 0.5, 1.5, v=1))
+    assert view.forming_period_end(Timeframe.M30) == start + 3600
+
+
+def test_forming_period_end_is_clamped_at_a_session_end_stub() -> None:
+    """The whole reason this accessor exists. A CME ETH day runs 18:00→17:00,
+    so its final 2h bucket is a STUB that closes at 17:00 — one hour short of
+    its natural grid end. `last_close + period` would overshoot the session,
+    and a strategy that armed a setup against that stamp would be waiting on
+    an instant no bar ever carries."""
+    view = MarketView(base_tf=Timeframe.M5, derived_tfs=[Timeframe.H2], days=DAYS2)
+    day = DAYS2.days[0]
+    for ts in range(day.start_unix + 300, day.end_unix + 1, 300):
+        view.update(bar(ts, 1, 2, 0.5, 1.5, v=1))
+        forming_end = view.forming_period_end(Timeframe.H2)
+        if forming_end is not None:
+            # Never past the session close, and never behind the bar itself.
+            assert forming_end <= day.end_unix
+            assert forming_end >= ts
+
+    # The last bucket of the day: 16:00→17:00 ET, a one-hour stub of a 2h TF.
+    completed = view.completed(Timeframe.H2)
+    assert completed[-1].timestamp == day.end_unix
+    naive = completed[-2].timestamp + Timeframe.H2.period_seconds
+    assert naive > day.end_unix  # what the wrong arithmetic would have said
+
+
+def test_forming_period_end_rejects_an_untracked_tf() -> None:
+    view = MarketView(base_tf=Timeframe.M5, derived_tfs=[Timeframe.M30], days=DAYS2)
+    with pytest.raises(KeyError, match="not a tracked derived TF"):
+        view.forming_period_end(Timeframe.H4)

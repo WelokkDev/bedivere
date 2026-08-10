@@ -3,8 +3,8 @@
 One engine, three environments: a backtest replays bars, a shadow session
 runs live bars against the in-process SimBroker, a live session runs the
 same bars against YOUR venue adapter. The only moving parts are the triad
-{BarStream, Clock, Broker} — everything downstream of the stream is the
-run_loop both runners share with run_backtest, which is the point.
+{BarStream, Clock, Broker}; everything downstream of the stream is the
+run_loop both runners share with run_backtest.
 
 Live-specific machinery owned here:
   - `journal_path` streams JSONL flushed per event (crash-safe) — a
@@ -12,6 +12,9 @@ Live-specific machinery owned here:
     the disk anything.
   - `journal_sinks` fan out each context-merged line; a `notifier` +
     `notify_on` kinds install a NotificationRouter as one more sink.
+  - PREFLIGHT: `broker.preflight()` runs before the first bar and REFUSES
+    the run on any reason it returns — a position or working order the run
+    did not create is not something to trade around.
   - FAIL-CLOSED FLATTEN: if the run ends or DIES with an open position,
     `broker.flatten(symbol)` is sent and the notifier warns you to confirm
     at the venue.
@@ -29,7 +32,7 @@ from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from types import FrameType
-from typing import Any
+from typing import Any, Protocol
 
 from bedivere.brokers.sim import SimBroker, SimBrokerConfig
 from bedivere.core.clock import Clock, LiveClock
@@ -46,6 +49,23 @@ from bedivere.notify.router import DEFAULT_KINDS, NotificationRouter
 from bedivere.run.record import RunRecord, build_result
 from bedivere.streams.live import LiveBarStream
 from bedivere.view.market_view import MarketView, ObserverFactory
+
+
+class LiveBroker(BrokerLike, Protocol):
+    """What a LIVE run needs beyond what the loop needs: the arming gate.
+
+    The engine loop is deliberately narrower — it never asks a broker whether
+    the run should have started, because by the time the loop is running that
+    question is already answered. Live composition is where it belongs, and
+    typing it here means an adapter without a `preflight` fails at your
+    composition root rather than at the venue.
+    """
+
+    def preflight(self) -> str | None: ...
+
+
+class PreflightError(RuntimeError):
+    """The venue is not in a state this run may start from."""
 
 
 class _StreamingTap:
@@ -82,13 +102,14 @@ def run_live(
     derived_timeframes: Sequence[Timeframe],
     days: SessionDays,
     instrument: InstrumentSpec,
-    broker: BrokerLike,
+    broker: LiveBroker,
     clock: Clock,
     strategy: Strategy,
     window: tuple[int, int],
     warmup: Sequence[WarmupRequirement] = (),
     observer_factory: ObserverFactory | None = None,
-    registry: CloseSink | None = None,
+    close_sink: CloseSink | None = None,
+    portfolio: Portfolio | None = None,
     params: dict[str, Any] | None = None,
     journal_context: dict[str, Any] | None = None,
     journal_path: str | Path | None = None,
@@ -101,8 +122,7 @@ def run_live(
     """Drive one session: an injected stream (usually a LiveBarStream your
     feed adapter pushes into), an injected clock (LiveClock in production),
     and an injected broker — SimBroker for an in-process shadow, your own
-    venue adapter for real orders. Nothing else differs from a backtest;
-    that is the point.
+    venue adapter for real orders. Nothing else differs from a backtest.
 
     This is the MAIN trader. The engine only knows which BROKER you gave
     it, never which ACCOUNT that broker points at — whether a session is
@@ -129,7 +149,10 @@ def run_live(
         days=days,
         observer_factory=observer_factory,
     )
-    portfolio = Portfolio(spec=instrument)
+    # A live composition may OWN the portfolio — a supervisor reporting open
+    # positions and trade counts every few seconds needs a handle on it, and
+    # reaching into a run mid-flight for one is worse than being handed it.
+    book = portfolio if portfolio is not None else Portfolio(spec=instrument)
     gate = WarmupGate(view, list(warmup)) if warmup else None
     alerts: Notifier = notifier if notifier is not None else NullNotifier()
 
@@ -142,6 +165,19 @@ def run_live(
     if notifier is not None:
         kinds = frozenset(notify_on) if notify_on is not None else DEFAULT_KINDS
         router = NotificationRouter(kinds, notifier, known_kinds=notify_known_kinds)
+
+    # Reconcile BEFORE anything is opened for writing: a refused run leaves no
+    # journal file and no archive behind. The notifier IS used — a refusal is
+    # precisely the thing an operator who is not at the terminal needs told.
+    blocked = broker.preflight()
+    if blocked is not None:
+        message = (
+            f"⛔ {mode} refused to start — {symbol}: {blocked} — "
+            "reconcile at the venue, then start again"
+        )
+        alerts.send(message)
+        alerts.close()
+        raise PreflightError(message)
 
     tap = _StreamingTap(Path(journal_path)) if journal_path is not None else None
     sinks: list[Callable[[dict[str, object]], None]] = []
@@ -171,15 +207,15 @@ def run_live(
             clock=clock,
             view=view,
             broker=broker,
-            portfolio=portfolio,
+            portfolio=book,
             strategy=strategy,
             tradeable_start_unix=window_start,
-            registry=registry,
+            close_sink=close_sink,
             warmup_gate=gate,
             journal=journal,
         )
     except BaseException as e:  # incl. KeyboardInterrupt — a dying run must say so
-        if portfolio.position_count() > 0:
+        if book.position_count() > 0:
             broker.flatten(symbol)
             alerts.send(
                 f"🚨 {mode} run failed with an open position — flatten sent; CONFIRM at your venue"
@@ -190,7 +226,7 @@ def run_live(
             tap.close()
         raise
 
-    if portfolio.position_count() > 0:
+    if book.position_count() > 0:
         broker.flatten(symbol)
         alerts.send(
             f"⚠ {mode} window ended with an open position — flatten sent; CONFIRM at your venue"
@@ -203,7 +239,7 @@ def run_live(
         window=window,
         warmup=warmup,
         loop_stats=loop_stats,
-        portfolio=portfolio,
+        portfolio=book,
         instrument=instrument,
         journal=journal,
         strategy=strategy,
@@ -240,7 +276,7 @@ def run_live(
     alerts.close()
     if tap is not None:
         tap.close()
-    return RunRecord(result=result, journal=journal, portfolio=portfolio, view=view)
+    return RunRecord(result=result, journal=journal, portfolio=book, view=view)
 
 
 def run_shadow(
@@ -257,10 +293,12 @@ def run_shadow(
     half_spread_ticks: int,
     commission_cents_per_side_per_contract: int,
     seed: int,
+    defer_protection_one_bar: bool,
     clock: Clock | None = None,
     warmup: Sequence[WarmupRequirement] = (),
     observer_factory: ObserverFactory | None = None,
-    registry: CloseSink | None = None,
+    close_sink: CloseSink | None = None,
+    portfolio: Portfolio | None = None,
     params: dict[str, Any] | None = None,
     journal_context: dict[str, Any] | None = None,
     journal_path: str | Path | None = None,
@@ -295,6 +333,7 @@ def run_shadow(
                 half_spread_ticks=half_spread_ticks,
                 commission_cents_per_side_per_contract=commission_cents_per_side_per_contract,
                 seed=seed,
+                defer_protection_one_bar=defer_protection_one_bar,
             ),
         ),
         clock=clock if clock is not None else LiveClock(),
@@ -302,7 +341,8 @@ def run_shadow(
         window=window,
         warmup=warmup,
         observer_factory=observer_factory,
-        registry=registry,
+        close_sink=close_sink,
+        portfolio=portfolio,
         params=params,
         journal_context=journal_context,
         journal_path=journal_path,

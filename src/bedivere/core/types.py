@@ -41,6 +41,7 @@ class Timeframe(StrEnum):
     the intraday chain.
     """
 
+    S1 = "1s"
     S15 = "15s"
     M5 = "5m"
     M15 = "15m"
@@ -65,17 +66,19 @@ class Timeframe(StrEnum):
 
 
 _TF_ORDER: dict[Timeframe, int] = {
-    Timeframe.S15: 0,
-    Timeframe.M5: 1,
-    Timeframe.M15: 2,
-    Timeframe.M30: 3,
-    Timeframe.H1: 4,
-    Timeframe.H2: 5,
-    Timeframe.H4: 6,
-    Timeframe.D1: 7,
+    Timeframe.S1: 0,
+    Timeframe.S15: 1,
+    Timeframe.M5: 2,
+    Timeframe.M15: 3,
+    Timeframe.M30: 4,
+    Timeframe.H1: 5,
+    Timeframe.H2: 6,
+    Timeframe.H4: 7,
+    Timeframe.D1: 8,
 }
 
 _PERIOD_SECONDS: dict[Timeframe, int] = {
+    Timeframe.S1: 1,
     Timeframe.S15: 15,
     Timeframe.M5: 5 * 60,
     Timeframe.M15: 15 * 60,
@@ -86,6 +89,7 @@ _PERIOD_SECONDS: dict[Timeframe, int] = {
 }
 
 SUPPORTED_TIMEFRAMES: tuple[Timeframe, ...] = (
+    Timeframe.S1,
     Timeframe.S15,
     Timeframe.M5,
     Timeframe.M15,

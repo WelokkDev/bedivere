@@ -55,6 +55,13 @@ class ReplayStream:
         """The series (ascending). Callers must not mutate."""
         return self._bars
 
+    @property
+    def first_ts(self) -> int | None:
+        """Close-stamp of the first bar, or None for an empty series — what a
+        composition root starts its ReplayClock at, without reaching into the
+        bar list itself."""
+        return self._bars[0].timestamp if self._bars else None
+
     def __len__(self) -> int:
         return len(self._bars)
 

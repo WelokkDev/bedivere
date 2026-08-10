@@ -10,3 +10,22 @@ build/
 
 # Run archives (regenerable, deterministic)
 runs/
+
+# Authoring notes. Kept out of git AND out of the sdist — hatchling's default
+# file selection follows this file, so an ignore here closes both paths.
+prompt-*.md
+
+# Market data. Bars are large, usually licensed, and never belong in a repo.
+# README walks you into exactly these paths, so they are ignored up front.
+# Anchored to the root: a bare `data/` would also swallow src/bedivere/data/.
+/data/
+*.csv
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Secrets
+.env
+.env.*

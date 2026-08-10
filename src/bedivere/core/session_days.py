@@ -135,7 +135,7 @@ def parse_session_days(payload: object) -> SessionDays:
     return SessionDays(template=template, timezone=timezone, days=tuple(days))
 
 
-# ---------- session-grid arithmetic (ex core/cache/validator.py) ----------
+# ---------- session-grid arithmetic ----------
 
 
 def expected_bar_count(sd: SessionDay, tf: Timeframe) -> int:

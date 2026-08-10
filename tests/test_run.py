@@ -109,6 +109,7 @@ def _run(tmp_path: Path | None = None) -> RunRecord:
         half_spread_ticks=0,
         commission_cents_per_side_per_contract=100,
         seed=1,
+        defer_protection_one_bar=False,
         warmup=[WarmupRequirement(Timeframe.M30, 4)],
         params={"strategy": "one-shot-long", "rr": 1.0},
         journal_context={"experiment": "e2e"},
@@ -186,6 +187,7 @@ def test_unready_warmup_hard_fails() -> None:
             half_spread_ticks=0,
             commission_cents_per_side_per_contract=100,
             seed=1,
+            defer_protection_one_bar=False,
             warmup=[WarmupRequirement(Timeframe.M30, 10_000)],
         )
 
@@ -205,4 +207,100 @@ def test_symbol_spec_mismatch_refused() -> None:
             half_spread_ticks=0,
             commission_cents_per_side_per_contract=0,
             seed=1,
+            defer_protection_one_bar=False,
         )
+
+
+class ClosesRecorder:
+    """Records what `ctx.closes` carried at each tradeable bar, so the push
+    can be compared against the view's own state."""
+
+    def __init__(self) -> None:
+        self.seen: list[tuple[int, list[tuple[str, int, int]]]] = []
+
+    def on_start(self, ctx: RunContext) -> None:
+        pass
+
+    def on_bar(self, ctx: RunContext) -> None:
+        if ctx.closes:
+            self.seen.append(
+                (
+                    ctx.bar.timestamp,
+                    [(c.tf.value, c.candle.timestamp, c.index) for c in ctx.closes],
+                )
+            )
+        # Whatever arrived must already be IN the view — the loop pushes
+        # after update(), never a bar early.
+        for close in ctx.closes:
+            assert ctx.view.completed(close.tf)[close.index] is close.candle
+
+    def on_order_event(self, ev: OrderEvent) -> None:
+        pass
+
+    def on_stop(self) -> None:
+        pass
+
+
+def test_ctx_closes_is_pushed_in_coarseness_order_and_matches_the_view() -> None:
+    """The loop already computed these to feed the close sink; pushing them
+    is what lets a strategy act on an HTF close without polling
+    len(view.completed(tf)) on every single bar."""
+    recorder = ClosesRecorder()
+    run = run_backtest(
+        bars=_bars(),
+        symbol="DEMO",
+        base_timeframe=Timeframe.M5,
+        derived_timeframes=[Timeframe.H1, Timeframe.M30],  # deliberately unsorted
+        days=DAYS,
+        instrument=SPEC,
+        strategy=recorder,
+        window=(DAYS.days[1].start_unix, DAYS.days[-1].end_unix),
+        latency_ms=0,
+        half_spread_ticks=0,
+        commission_cents_per_side_per_contract=0,
+        seed=1,
+        defer_protection_one_bar=False,
+    )
+
+    assert recorder.seen, "no HTF closes reached the strategy"
+    for bar_ts, closes in recorder.seen:
+        # A close is stamped at the bar that completed it.
+        assert all(ts == bar_ts for _, ts, _ in closes)
+        # Coarseness-ASCENDING, regardless of how derived_timeframes was
+        # ordered at the call site.
+        orders = [Timeframe(tf).order for tf, _, _ in closes]
+        assert orders == sorted(orders)
+        assert len(set(orders)) == len(orders)  # one close per TF per instant
+
+    # Every close the loop counted was pushed exactly once (warm-up bars are
+    # suppressed, so the strategy sees only the tradeable window's share).
+    pushed = sum(len(c) for _, c in recorder.seen)
+    assert 0 < pushed <= run.result["loop"]["htfCloses"]
+
+    # An hour boundary reports BOTH TFs at the same instant, coarser last.
+    both = [c for _, c in recorder.seen if len(c) == 2]
+    assert both, "expected an instant where 30m and 1h closed together"
+    assert [tf for tf, _, _ in both[0]] == ["30m", "1h"]
+
+
+def test_ctx_closes_is_empty_on_an_ordinary_bar() -> None:
+    recorder = ClosesRecorder()
+    run_backtest(
+        bars=_bars(),
+        symbol="DEMO",
+        base_timeframe=Timeframe.M5,
+        derived_timeframes=[Timeframe.M30],
+        days=DAYS,
+        instrument=SPEC,
+        strategy=recorder,
+        window=(DAYS.days[1].start_unix, DAYS.days[-1].end_unix),
+        latency_ms=0,
+        half_spread_ticks=0,
+        commission_cents_per_side_per_contract=0,
+        seed=1,
+        defer_protection_one_bar=False,
+    )
+    # 5m bars into 30m buckets: one close every six bars, so the vast
+    # majority of bars carry nothing.
+    tradeable = sum(1 for day in DAYS.days[1:] for _ in range(day.start_unix, day.end_unix, 300))
+    assert len(recorder.seen) < tradeable // 4

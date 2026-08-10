@@ -49,7 +49,7 @@ def aggregate_candles(
         raise ValueError(
             'aggregate_candles: target "1d" is not supported by the intraday aggregator — daily bars are session rollups, out of scope here.'
         )
-    if target_timeframe in (Timeframe.S15, Timeframe.M5, Timeframe.M15):
+    if target_timeframe in (Timeframe.S1, Timeframe.S15, Timeframe.M5, Timeframe.M15):
         return _mark_partial([_strip_partial(c) for c in candles], options)
 
     if options.alignment not in ("session_aligned_with_stubs", "wall_clock_utc"):

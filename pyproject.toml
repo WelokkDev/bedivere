@@ -8,7 +8,16 @@ requires-python = ">=3.12"
 dependencies = [
     # zoneinfo has no system tz database on Windows; tzdata supplies IANA data.
     "tzdata>=2024.1",
+    # Strategy config + spec envelope: frozen models, extra="forbid" everywhere,
+    # and validation errors that name the offending path.
+    "pydantic>=2.7",
 ]
+
+[project.scripts]
+bedivere-backtest = "bedivere.cli.backtest:main"
+bedivere-live = "bedivere.cli.live:main"
+bedivere-data = "bedivere.cli.data:main"
+bedivere-runs = "bedivere.cli.runs:main"
 
 [dependency-groups]
 dev = [
@@ -23,6 +32,22 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/bedivere"]
+
+# Hatchling's sdist default is "every file git does not ignore", which silently
+# collects whatever lands in the repo root — authoring notes, scratch specs, a
+# stray data file. An explicit allowlist makes the sdist default-DENY, so the
+# published artifact only ever grows when someone edits this list.
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src/bedivere",
+    "/tests",
+    "/examples",
+    "/specs",
+    "/docs",
+    "/conftest.py",
+    "/README.md",
+    "/LICENSE",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

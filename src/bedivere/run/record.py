@@ -30,6 +30,7 @@ from bedivere.engine.loop import LoopStats
 from bedivere.engine.metrics import compute_metrics
 from bedivere.engine.portfolio import Portfolio
 from bedivere.engine.warmup import WarmupRequirement
+from bedivere.run.archive import write_run_files
 from bedivere.view.market_view import MarketView
 
 
@@ -43,17 +44,22 @@ class RunRecord:
     portfolio: Portfolio
     view: MarketView
 
-    def write(self, directory: str | Path) -> Path:
+    def write(self, directory: str | Path, *, spec: dict[str, Any] | None = None) -> Path:
         """Archive the run: result.json + journal.jsonl under `directory`
-        (created if needed). Both files are deterministic — diff two runs
-        directly. Returns the directory."""
-        out = Path(directory)
-        out.mkdir(parents=True, exist_ok=True)
-        (out / "result.json").write_text(
-            json.dumps(self.result, sort_keys=True, indent=2), encoding="utf-8"
+        (created if needed), plus spec.json when a resolved spec is supplied.
+        Both files are deterministic — diff two runs directly. Returns the
+        directory.
+
+        A thin wrapper over `bedivere.run.archive.write_run_files`, so a
+        hand-composed script and the CLI produce byte-identical directories
+        and the crash-safe write lives in one place. The CLI additionally
+        appends to the runs index; a library caller who names their own
+        directory has opted out of that, which is why this is the narrower
+        of the two entry points.
+        """
+        return write_run_files(
+            Path(directory), result=self.result, journal=self.journal, spec=spec
         )
-        self.journal.write_jsonl(out / "journal.jsonl")
-        return out
 
 
 def build_result(
@@ -91,8 +97,9 @@ def build_result(
         },
         "trades": [t.to_jsonable(instrument) for t in portfolio.trades],
         "summary": portfolio.summary_jsonable(),
-        "metrics": compute_metrics(portfolio.trades, instrument),
-        "journal": {"events": len(journal.events)},
+        "metrics": compute_metrics(portfolio.trades, instrument, days=view.days),
+        # sha256 folds the journal into resultHash: one hash, both artifacts.
+        "journal": {"events": len(journal.events), "sha256": journal.sha256_hex()},
     }
     result.update(extra)
     if params is not None:
@@ -101,8 +108,36 @@ def build_result(
     strategy_summary = getattr(strategy, "summary_jsonable", None)
     if callable(strategy_summary):
         result["strategy"] = strategy_summary()
+    result["decisionsHash"] = decisions_digest(result)
     result["resultHash"] = canonical_sha256(result)
     return result
+
+
+# What a run DECIDED and what came of it, as opposed to how it was executed.
+# Deliberately excludes every environment block (sim costs, feed counters,
+# the replay fidelity report) and every count of the machinery (`loop.bars`
+# differs between a coarse and a fine replay of the same session by three
+# orders of magnitude, and means nothing about the trading).
+#
+# `journal` is in here via its sha256, which makes this a far stronger claim
+# than a trade-list comparison: two runs matching on this hash agree line for
+# line about every signal seen, every rejection and its named reason, and
+# every venue event — not merely about what they ended up trading.
+_DECISION_KEYS = ("trades", "summary", "strategy", "journal")
+
+
+def decisions_digest(result: dict[str, Any]) -> str:
+    """Fingerprint of the decisions and outcomes only.
+
+    `resultHash` answers "is this the same run?" and must change when the
+    environment changes — that is what makes it a determinism gate. But two
+    runs can legitimately differ in environment while being required to make
+    IDENTICAL decisions: a sparse replay against a full one, a refactor that
+    changes only a counter's name. `decisionsHash` is the comparison for
+    those, and keeping it a separate field rather than narrowing `resultHash`
+    means a fidelity label still shows up as a changed run.
+    """
+    return canonical_sha256({k: result[k] for k in _DECISION_KEYS if k in result})
 
 
 def canonical_sha256(payload: dict[str, Any]) -> str:

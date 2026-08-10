@@ -16,13 +16,16 @@ PERIOD = 300
 T0 = 1_780_524_000  # aligned reference instant
 
 
-def _cfg(latency_ms: int = 250, spread: int = 1, fee: int = 0) -> SimBrokerConfig:
+def _cfg(
+    latency_ms: int = 250, spread: int = 1, fee: int = 0, *, defer: bool = False
+) -> SimBrokerConfig:
     return SimBrokerConfig(
         bar_period_seconds=PERIOD,
         latency_ms=latency_ms,
         half_spread_ticks=spread,
         commission_cents_per_side_per_contract=fee,
         seed=0,
+        defer_protection_one_bar=defer,
     )
 
 
@@ -173,9 +176,11 @@ def test_flatten_cancels_pending_and_exits_open_at_next_open() -> None:
     pending = broker.submit_bracket(_intent("long"))
     broker.flatten("NQ")
     events = broker.drain(_bar(2, 20_005.0, 20_006.0, 20_004.0, 20_005.0))
-    assert [e.kind for e in events] == ["flatten_fill"]
+    assert [e.kind for e in events] == ["flatten_fill", "cancelled"]
     assert events[0].bracket_id == bid
     assert events[0].price_ticks == _t(20_004.75)  # open − spread on the exit sell
+    # The swept pending entry reports itself, with the cause attached.
+    assert (events[1].bracket_id, events[1].reason) == (pending, "flatten")
     with pytest.raises(ValueError, match="pending"):
         broker.cancel(pending)  # already cancelled by flatten
 
@@ -188,12 +193,16 @@ def test_change_amends_and_misuse_raises() -> None:
     assert [e.kind for e in events] == ["stop_fill"]
     assert events[0].price_ticks == fill - 4
 
+    # A cancel is confirmed by an event, not by silently flipping a phase.
     fresh = SimBroker(NQ, _cfg())
     pending = fresh.submit_bracket(_intent("long"))
-    with pytest.raises(ValueError, match="not open"):
-        fresh.change(pending, stop_ticks=1)
     fresh.cancel(pending)
-    assert fresh.drain(_bar(1, 20_001, 20_002, 20_000, 20_001)) == []
+    cancelled = fresh.drain(_bar(1, 20_001, 20_002, 20_000, 20_001))
+    assert [e.kind for e in cancelled] == ["cancelled"]
+    assert cancelled[0].reason == "strategy_cancel"
+    # A retired bracket has no legs to amend — working OR future.
+    with pytest.raises(ValueError, match="not open or pending"):
+        fresh.change(pending, stop_ticks=1)
     with pytest.raises(KeyError):
         fresh.change(999, stop_ticks=1)
 
@@ -213,10 +222,12 @@ def test_fees_charged_per_side_per_contract() -> None:
 def test_config_validation() -> None:
     with pytest.raises(ValueError):
         SimBrokerConfig(bar_period_seconds=0, latency_ms=0, half_spread_ticks=0,
-                        commission_cents_per_side_per_contract=0, seed=0)
+                        commission_cents_per_side_per_contract=0, seed=0,
+                        defer_protection_one_bar=False)
     with pytest.raises(ValueError):
         SimBrokerConfig(bar_period_seconds=300, latency_ms=-1, half_spread_ticks=0,
-                        commission_cents_per_side_per_contract=0, seed=0)
+                        commission_cents_per_side_per_contract=0, seed=0,
+                        defer_protection_one_bar=False)
 
 
 def test_deterministic_event_order_across_brackets() -> None:
@@ -230,3 +241,48 @@ def test_deterministic_event_order_across_brackets() -> None:
         (b, "entry_fill"),
         (b, "protection_placed"),
     ]
+
+
+# ---------- the naked window: defer_protection_one_bar ----------
+
+
+def test_by_default_protection_is_armed_on_the_entry_bar() -> None:
+    """At a coarse base the naked window is sub-bar, so a bar that fills the
+    entry AND reaches the stop exits on that same bar."""
+    broker = SimBroker(NQ, _cfg())
+    broker.submit_bracket(_intent("long", stop=19_990.0))
+    broker.drain(_bar(1, 20_000.0, 20_000.0, 19_000.0, 19_500.0))
+    kinds = [e.kind for e in broker.drain(_bar(2, 19_500.0, 19_500.0, 19_400.0, 19_450.0))]
+    assert "stop_fill" not in kinds, "it should already have exited on the entry bar"
+    assert broker.deferred_protection_bars == 0
+
+
+def test_deferring_moves_that_exit_to_the_next_bar_and_counts_it() -> None:
+    """At a fine base the naked window is a real slice of the bar, and a
+    stop a few ticks away cannot absorb it. Deferring is a CHOICE, and both
+    halves of it are reported: how often it applied, and how much it hid."""
+    broker = SimBroker(NQ, _cfg(defer=True))
+    broker.submit_bracket(_intent("long", stop=19_990.0))
+    entry_bar = [e.kind for e in broker.drain(_bar(1, 20_000.0, 20_000.0, 19_000.0, 19_500.0))]
+
+    assert "entry_fill" in entry_bar
+    assert "stop_fill" not in entry_bar, "protection must not be armed on the fill bar"
+    assert broker.deferred_protection_bars == 1
+    # The bar WOULD have stopped us out, and the counter says so — a silent
+    # deferral is an unmeasured assumption.
+    assert broker.deferred_protection_suppressed == 1
+
+    later = [e.kind for e in broker.drain(_bar(2, 19_500.0, 19_500.0, 19_400.0, 19_450.0))]
+    assert "stop_fill" in later, "protection must be live from the very next bar"
+
+
+def test_a_deferral_that_hid_nothing_is_counted_separately() -> None:
+    """`deferred_protection_bars` counts frequency; `..._suppressed` counts
+    consequence. A run where the two differ wildly is telling you the knob
+    barely matters for it — which is a finding, not noise."""
+    broker = SimBroker(NQ, _cfg(defer=True))
+    broker.submit_bracket(_intent("long", stop=19_000.0, rr=50.0))
+    broker.drain(_bar(1, 20_000.0, 20_000.5, 19_999.5, 20_000.0))  # neither leg reachable
+
+    assert broker.deferred_protection_bars == 1
+    assert broker.deferred_protection_suppressed == 0

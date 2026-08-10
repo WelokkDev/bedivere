@@ -259,6 +259,23 @@ class MarketView:
             volume=ob.volume,
         )
 
+    def forming_period_end(self, tf: Timeframe) -> int | None:
+        """The close-stamp the currently-forming bucket WILL carry, or None
+        when no bucket is open on that TF.
+
+        A strategy that decides an HTF bar at the open of its successor needs
+        this stamp and must never derive it as `last_close + period`: that
+        arithmetic is wrong at a session-end stub bucket, which closes early,
+        and blind to a gap in the data, which moves the next bucket entirely.
+        This comes from `bucket_period_end`, so it is session-day clamped by
+        construction.
+
+        None between a close and the next base bar — a bucket cannot be
+        decided before it exists.
+        """
+        ob = self._state_of(tf).open_bucket
+        return None if ob is None else ob.period_end
+
     def _state_of(self, tf: Timeframe) -> _TfState:
         state = self._states.get(tf)
         if state is None:

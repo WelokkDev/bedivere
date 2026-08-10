@@ -108,3 +108,53 @@ def test_summary_shape() -> None:
         "ambiguousFills": 0,
         "openPositions": 0,
     }
+
+
+# ---------- the strategy's read surface ----------
+
+
+def test_bracket_live_tracks_pending_then_open_then_gone() -> None:
+    """The query a strategy uses to SELF-HEAL: a tracker stuck on a bracket
+    the portfolio no longer holds means its terminal event never arrived,
+    and the portfolio is truth."""
+    p, intent = Portfolio(spec=NQ), _intent()
+    p.register_intent(1, intent)
+    assert p.bracket_live(1)  # pending
+
+    p.apply([_fill("entry_fill", 1, 80_000)])
+    assert p.bracket_live(1)  # open
+
+    p.apply([_fill("stop_fill", 1, 79_900)])
+    assert not p.bracket_live(1)
+    assert not p.bracket_live(999)  # never seen
+
+
+def test_intent_and_entry_lookups_answer_from_engine_state() -> None:
+    """So `on_order_event` — which gets no ctx — can report what was ASKED
+    for beside what happened, without the strategy keeping its own books."""
+    p, intent = Portfolio(spec=NQ), _intent()
+    p.register_intent(1, intent)
+    assert p.intent_for(1) is intent
+    assert p.entry_ticks_for(1) is None  # not filled yet
+
+    p.apply([_fill("entry_fill", 1, 80_000)])
+    assert p.entry_ticks_for(1) == 80_000
+
+    p.apply([_fill("target_fill", 1, 80_300)])
+    # Closed: the open-position lookup goes quiet and the trade lookup answers.
+    assert p.entry_ticks_for(1) is None
+    trade = p.last_trade_for(1)
+    assert trade is not None and trade.exit_ticks == 80_300
+    assert p.last_trade_for(999) is None
+
+
+def test_last_trade_for_returns_the_most_recent_round_trip() -> None:
+    """A bracket id can be reused across attempts by a retrying strategy;
+    the answer must be the latest, not the first."""
+    p = Portfolio(spec=NQ)
+    for exit_ticks in (79_900, 80_400):
+        p.register_intent(1, _intent())
+        p.apply([_fill("entry_fill", 1, 80_000)])
+        p.apply([_fill("stop_fill", 1, exit_ticks)])
+    trade = p.last_trade_for(1)
+    assert trade is not None and trade.exit_ticks == 80_400

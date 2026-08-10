@@ -18,9 +18,10 @@ line).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -45,11 +46,30 @@ class DecisionJournal:
             except Exception as e:  # noqa: BLE001 — the tap may not break the loop
                 sys.stderr.write(f"[journal] sink failed on {kind}: {e}\n")
 
+    def serialized_lines(self) -> Iterator[str]:
+        """THE canonical serialization. `write_jsonl` and `sha256_hex` share
+        it, so the digest covers exactly the bytes on disk by construction
+        rather than by two implementations agreeing."""
+        for event in self.events:
+            line = {**self.context, **event} if self.context else event
+            yield json.dumps(line, sort_keys=True, separators=(",", ":")) + "\n"
+
+    def sha256_hex(self) -> str:
+        """Digest of the canonical JSONL, stamped into the result so
+        `resultHash` covers the journal too.
+
+        Without it a fingerprint sees trades and counters only: a refactor
+        that changed a rejection reason or reordered emissions, leaving the
+        trade list untouched, would reproduce the old hash exactly.
+        """
+        digest = hashlib.sha256()
+        for line in self.serialized_lines():
+            digest.update(line.encode("utf-8"))
+        return digest.hexdigest()
+
     def write_jsonl(self, path: Path) -> int:
         """One sorted-keys JSON object per line; returns the event count."""
         with path.open("w", encoding="utf-8", newline="\n") as f:
-            for event in self.events:
-                line = {**self.context, **event} if self.context else event
-                f.write(json.dumps(line, sort_keys=True, separators=(",", ":")))
-                f.write("\n")
+            for line in self.serialized_lines():
+                f.write(line)
         return len(self.events)
