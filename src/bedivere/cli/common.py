@@ -21,6 +21,8 @@ BOUNDARY CONVENTIONS, held by every command in this package:
   - a failure prints one line naming what was wrong, not a traceback. The
     traceback is for bedivere's bugs; a bad spec is yours, and telling you
     which path was bad is more useful than telling you which frame raised.
+  - `./.env` is loaded before the command runs, and never over a variable the
+    environment already holds.
 """
 
 from __future__ import annotations
@@ -28,8 +30,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, MutableMapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -59,6 +62,7 @@ from bedivere.core.session_days import SessionDays
 from bedivere.core.types import Candle, Timeframe
 from bedivere.data.build import build_candle_source
 from bedivere.data.port import CandleSource, assess_coverage
+from bedivere.data.source import BarSourceError, require_timeframes
 from bedivere.engine.loop import Strategy
 from bedivere.engine.warmup import WarmupRequirement, lookback_load_start
 from bedivere.notify.discord import DiscordNotifier
@@ -231,14 +235,19 @@ def build_source(run: ResolvedRun, *, timeframe: Timeframe | None = None) -> Can
     if run.spec.data is None:
         raise CliError(
             "this spec has no `data` block, so there are no bars to run on — add one "
-            '(e.g. {"source": "sqlite", "path": "data/candles.db"})'
+            '(e.g. {"source": "lake", "dataset": "GLBX.MDP3", "series": "local.v.0"} '
+            'or {"source": "csv", "path": "data/DEMO-5m.csv"})'
         )
+    tf = timeframe or run.base_tf
     try:
-        return build_candle_source(
-            run.spec.data, symbol=run.symbol, timeframe=timeframe or run.base_tf
-        )
-    except (ResolutionError, ValueError) as e:
+        source = build_candle_source(run.spec.data, symbol=run.symbol, timeframe=tf, days=run.days)
+        # The cheapest possible refusal: "this store has no NQ 1s" costs one
+        # directory listing, and finding it out an hour later instead looks like
+        # a strategy that took no trades.
+        require_timeframes(source, run.symbol, [tf])
+    except (BarSourceError, ResolutionError, ValueError) as e:
         raise CliError(str(e)) from e
+    return source
 
 
 def load_bars(
@@ -261,6 +270,8 @@ def load_bars(
     tf = timeframe or run.base_tf
     try:
         bars = source.candles(run.symbol, tf, start_unix, end_unix)
+    except BarSourceError as e:
+        raise CliError(str(e)) from e
     except (OSError, ValueError) as e:
         raise CliError(f"{source.describe()}: {e}") from e
 
@@ -302,10 +313,64 @@ def build_notifier(transport: str) -> Notifier | None:
     if transport == "discord" or (transport == "auto" and webhook):
         if not webhook:
             raise CliError(
-                f"--notify discord needs {DISCORD_WEBHOOK_ENV} in the environment"
+                f"--notify discord needs {DISCORD_WEBHOOK_ENV} in the environment or ./.env"
             )
         return DiscordNotifier(webhook)
     return ConsoleNotifier(prefix="[alert]")
+
+
+# ---------- environment ----------
+
+
+DOTENV_FILE = Path(".env")
+"""Relative, so it is read from the working directory — where uv, Docker Compose
+and most dotenv loaders look. Module-level so the test suite can point it away
+from a real `.env` holding real keys."""
+
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def load_dotenv(
+    path: Path | None = None, *, environ: MutableMapping[str, str] = os.environ
+) -> None:
+    """Copy `KEY=VALUE` lines from `./.env` into the environment.
+
+    A variable the environment already holds WINS, so
+    `DATABENTO_API_KEY=... bedivere-data cost ...` still overrides the file for
+    one command. A missing file is not an error.
+
+    The small common subset, rather than a dependency: blank lines and `#`
+    comments, an optional `export ` prefix, one pair of matching quotes around a
+    value, and ` #` ending an unquoted one. No interpolation, no escapes, no
+    multi-line values. A line outside that subset is skipped with a warning that
+    names its line number and never its content, which is likely a secret.
+    """
+    target = DOTENV_FILE if path is None else path
+    try:
+        # utf-8-sig: an editor that writes a BOM would otherwise corrupt the first key.
+        text = target.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, sep, value = line.removeprefix("export ").partition("=")
+        name = name.strip()
+        if not sep or not _ENV_NAME.fullmatch(name):
+            note(f"warning: {target}:{number} is not KEY=VALUE — skipped")
+            continue
+        if name not in environ:
+            environ[name] = _dotenv_value(value.strip())
+
+
+def _dotenv_value(value: str) -> str:
+    if value[:1] in ('"', "'"):
+        closing = value.find(value[0], 1)
+        if closing > 0:
+            return value[1:closing]
+    comment = value.find(" #")
+    return value if comment < 0 else value[:comment].rstrip()
 
 
 # ---------- boundary ----------
@@ -318,8 +383,10 @@ def emit_result(result: dict[str, Any]) -> None:
 
 
 def run_command(body: Callable[[], int]) -> int:
-    """The exit-code boundary every command shares."""
+    """The boundary every command shares: `./.env` is loaded, then every
+    outcome becomes an exit code."""
     try:
+        load_dotenv()
         return body()
     except KeyboardInterrupt:
         note("\naborted (hard)")

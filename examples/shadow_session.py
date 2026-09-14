@@ -112,6 +112,7 @@ def main() -> None:
             half_spread_ticks=1,
             commission_cents_per_side_per_contract=105,
             seed=11,
+            defer_protection_one_bar=False,
             clock=clock,
             warmup=[WarmupRequirement(Timeframe.M30, 12)],
             journal_context={"example": "shadow_session"},

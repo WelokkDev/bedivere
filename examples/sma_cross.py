@@ -165,6 +165,7 @@ def main() -> None:
         half_spread_ticks=1,
         commission_cents_per_side_per_contract=105,
         seed=7,
+        defer_protection_one_bar=False,
         warmup=[WarmupRequirement(SIGNAL_TF, SLOW)],
         params={"fast": FAST, "slow": SLOW, "rr": RR, "signalTf": SIGNAL_TF.value},
         journal_context={"example": "sma_cross"},

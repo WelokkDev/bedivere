@@ -16,12 +16,18 @@ Loaders for other backends (a database, a broker export) belong beside
 this one in bedivere/data/ — the contract is simply "return clean
 Candles"; the streams and the engine never fetch data themselves.
 
-`load_candles_csv` stays the zero-setup path: a list of Candles, no schema,
-no import step. `CsvCandleSource` wraps it in the `CandleSource` port so a
-spec-driven run can name a CSV file and be wired identically to one reading
-SQLite. It reads the file ONCE and slices in memory — right for the file
-sizes a CSV is a reasonable choice for, and the reason a real cache exists
-for the sizes it is not.
+`load_candles_csv` is the zero-setup path: a list of Candles, no schema, no
+import step, no native dependency. `CsvCandleSource` wraps it in the
+`CandleSource` port, so a spec-driven run can name a CSV file and be wired
+exactly like one reading the lake — which is the point of the port, and what
+lets a reviewer clone this repo and get a real backtest out of it in one
+command.
+
+It reads the file ONCE and slices in memory. That is right for the sizes a
+CSV is a reasonable choice for, and it is why `bedivere.data.lake` exists for
+the sizes it is not: one file is one (symbol, timeframe) with no provenance,
+nothing to say which contract each bar traded on, and no way to answer which
+session-days it should have held. Research ranges go in the lake.
 """
 
 from __future__ import annotations

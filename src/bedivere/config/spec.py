@@ -11,7 +11,7 @@
       "window":  {"firstTradeDate": "2026-06-02", "lastTradeDate": "2026-06-19"},
       "sim":     {"latencyMs": 250, "halfSpreadTicks": 1, ...},
       "notify":  {"on": ["entry_fill"], "transport": "auto"},
-      "data":    {"source": "sqlite", "path": "data/candles.db"}
+      "data":    {"source": "lake", "dataset": "GLBX.MDP3", "series": "local.v.0"}
     }
 
 The design goal, and the reason `window` is optional: **a backtested spec IS
@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any, Literal, Self, cast
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, StrictBool, ValidationError, model_validator
 from pydantic.alias_generators import to_camel
 
 from bedivere.config.base import ConfigError, format_validation_error
@@ -185,7 +185,7 @@ class SimSpec(SpecModel):
 
 
 class ReplaySpec(SpecModel):
-    """How finely to replay — see docs/backtest-fidelity.md.
+    """How finely to replay — see `bedivere.streams.sparse`.
 
     `full` (the default) replays every base bar. `sparse` runs the strategy's
     trigger rule over the coarser series named here, and descends to the base
@@ -225,28 +225,104 @@ class NotifySpec(SpecModel):
     transport: Literal["auto", "console", "discord", "off"] = "auto"
 
 
-class DataSpec(SpecModel):
-    """Where bars come from. `csv` and `sqlite` need a `path`; `python` names
-    a factory returning a `CandleSource`, which is how a proprietary feed
-    plugs in without a file format in between."""
+class AdjustmentSpec(SpecModel):
+    """A read-time price adjustment over a lake series.
 
-    source: Literal["csv", "sqlite", "python"]
+    `asOf` has deliberately no default: there is no spelling for "back-adjusted,
+    whatever the rolls happen to be today". Pinning the date pins the roll set,
+    so the same spec reproduces the same prices a year from now.
+    """
+
+    method: Literal["back_adjusted"]
+    as_of: str | None = None
+
+    @model_validator(mode="after")
+    def _as_of_is_required(self) -> Self:
+        if self.as_of is None:
+            raise ValueError(
+                'a back_adjusted source requires `asOf` (YYYY-MM-DD). An adjusted series '
+                "without a pinned as-of date changes meaning at every roll — there is no "
+                "safe default"
+            )
+        return self
+
+
+class DataSpec(SpecModel):
+    """Where bars come from.
+
+        csv     `path` — one file, one series, zero setup and zero dependencies
+        lake    `dataset` + `series` (+ optional `root`, `adjustment`) — the
+                Parquet bar lake, which is what a real research range wants
+        python  `factory` — any source at all, with no file format in between
+
+    `allowStale` opts out of the coverage check that otherwise refuses a window
+    reaching past the end of the store. It lives in the spec rather than on the
+    command line so a run that accepted a short answer says so in its own
+    archived record.
+    """
+
+    source: Literal["csv", "lake", "python"]
     path: str | None = None
     factory: str | None = None
     options: dict[str, Any] = {}
+    dataset: str | None = None
+    series: str | None = None
+    root: str | None = None
+    adjustment: AdjustmentSpec | None = None
+    # StrictBool, not bool: pydantic's lax mode reads "yes" and 1 as True, and
+    # this is the one field in the envelope whose value DISARMS a check.
+    allow_stale: StrictBool = False
 
     @model_validator(mode="after")
     def _shape(self) -> Self:
+        lake_only = [
+            to_camel(name)
+            for name in ("dataset", "series", "root")
+            if getattr(self, name) is not None
+        ]
+        if self.source != "lake":
+            if lake_only:
+                raise ValueError(
+                    f'data.source "{self.source}" does not take {lake_only} — those name a '
+                    "lake series"
+                )
+            if self.adjustment is not None:
+                raise ValueError(
+                    'data.adjustment is lake-only: a file is a single already-served series '
+                    "with no per-bar contract identity, so there is nothing to derive an "
+                    'adjusted view FROM. Point the spec at {"source": "lake", ...} — silently '
+                    "serving raw bars for an adjusted request is the exact degrade this "
+                    "refusal exists to prevent"
+                )
+
         if self.source == "python":
             if self.factory is None:
                 raise ValueError('data.source "python" needs `factory` ("module:attribute")')
             if self.path is not None:
                 raise ValueError('data.source "python" takes `factory`, not `path`')
-        else:
+            return self
+
+        if self.factory is not None:
+            raise ValueError(f'data.source "{self.source}" takes no `factory`')
+
+        if self.source == "csv":
             if self.path is None:
-                raise ValueError(f'data.source "{self.source}" needs `path`')
-            if self.factory is not None:
-                raise ValueError(f'data.source "{self.source}" takes `path`, not `factory`')
+                raise ValueError('data.source "csv" needs `path`')
+            return self
+
+        # lake
+        if self.path is not None:
+            raise ValueError(
+                'data.source "lake" takes `dataset`/`series` (and optionally `root`), not '
+                "`path` — a lake holds many series and the path alone cannot say which"
+            )
+        if self.dataset is None or self.series is None:
+            raise ValueError(
+                'data.source "lake" needs `dataset` and `series` (e.g. {"source": "lake", '
+                '"dataset": "GLBX.MDP3", "series": "local.v.0"}) — there is no safe default, '
+                "because two series select different contracts and are therefore two "
+                "different price series"
+            )
         return self
 
 
@@ -500,6 +576,7 @@ def _utc(unix_sec: int) -> str:
 
 
 __all__ = [
+    "AdjustmentSpec",
     "ConfigError",
     "DataSpec",
     "FactorySpec",

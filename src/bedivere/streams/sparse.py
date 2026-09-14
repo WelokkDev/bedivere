@@ -29,9 +29,8 @@ a bracket survives the bell. Anything beyond that (a two-night hold, a
 shortened `window_seconds` horizon) is caught by `assert_trades_covered`
 rather than hoped about.
 
-See docs/backtest-fidelity.md for the full hazard list and the parity gate:
-a sparse run must reproduce a full run's `decisionsHash` exactly, or the
-shortcut is not usable for that strategy.
+THE PARITY GATE: a sparse run must reproduce a full run's `decisionsHash`
+exactly, or the shortcut is not usable for that strategy.
 """
 
 from __future__ import annotations
@@ -49,7 +48,7 @@ from bedivere.engine.events import BarEvent
 # with the prefix ending at it, so the rule is causal by construction — it
 # cannot see its own future even by accident.
 #
-# The rule must read the coarse series ONLY. See hazard 1 above.
+# The rule must read the coarse series ONLY. See THE PRECONDITION above.
 TriggerRule = Callable[[Sequence[Candle]], bool]
 
 # Fine bars for a half-open `(start_unix, end_unix]` range — the same
@@ -519,7 +518,8 @@ def verify_agreement(
             f"{len(missing)} trigger(s) the pre-pass found are absent from the run's "
             f"coarse series {missing[:5]}, {len(extra)} the run found were not "
             f"pre-selected {extra[:5]}. A cached coarse bar is not the aggregate of "
-            "its fine bars, or the trigger rule reads intrabar data (see hazard 1)."
+            "its fine bars, or the trigger rule reads intrabar data (see the "
+            "bedivere.streams.sparse module docstring)."
         )
     return actual
 

@@ -2,7 +2,7 @@
 
 Everything downstream of this file depends on the PROTOCOL, never on the
 storage: a composition asks for `(symbol, timeframe, start, end)` and gets
-bars. A CSV file, a SQLite cache and a vendor SDK are then the same thing to
+bars. A CSV file, the Parquet lake and a vendor SDK are then the same thing to
 a run, which is what lets a strategy backtested from a file run live from a
 feed without a line changing.
 
@@ -24,7 +24,7 @@ so both answers come from one definition of "the bars that should exist".
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from bedivere.core.session_days import SessionDays, expected_close_stamps
 from bedivere.core.types import Candle, Timeframe
@@ -43,6 +43,40 @@ class CandleSource(Protocol):
     def describe(self) -> str:
         """One line naming where these bars came from, for the run log and the
         archived provenance. Not parsed by anything."""
+        ...
+
+
+@runtime_checkable
+class InspectableSource(Protocol):
+    """The OPTIONAL half of the port: a source that can be asked what it holds.
+
+    `CandleSource` stays two methods wide on purpose, so a proprietary feed can
+    satisfy it in an afternoon; everything a GATE needs is here instead, and a
+    source that cannot answer is refused by name at the gate rather than
+    excluded from the engine. A CSV implements none of this and is none the worse
+    for it — it is the entire series it holds and says so on the first read.
+    """
+
+    def has(self, symbol: str, timeframe: Timeframe) -> bool:
+        """ANY bars for the pair — a preflight, not a claim about a window."""
+        ...
+
+    def latest(self, symbol: str, timeframe: Timeframe) -> int | None:
+        """Close-stamp of the newest bar held, or None when there are none — a
+        request reaching past it can only be answered short."""
+        ...
+
+    def covered_days(
+        self, symbol: str, timeframe: Timeframe, days: SessionDays
+    ) -> frozenset[str]:
+        """Which of `days` this source actually holds bars for."""
+        ...
+
+    @property
+    def price_basis(self) -> str:
+        """`as_traded` or `back_adjusted`. Two runs on different bases are not
+        comparable, so the answer belongs in the run record beside the numbers
+        it produced."""
         ...
 
 

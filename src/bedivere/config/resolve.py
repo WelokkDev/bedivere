@@ -86,7 +86,7 @@ class StrategyPlugin[C: StrategyConfig]:
     warmup: Callable[[C], Sequence[WarmupRequirement]] = _no_warmup
     close_sink: Callable[[C], CloseSink | None] = field(default=lambda _cfg: None)
     observers: Callable[[C], ObserverFactory | None] = field(default=lambda _cfg: None)
-    # The four below are optional seams; see docs/writing-a-strategy.md.
+    # The four below are optional seams.
     #
     # The arming condition over COARSE bars only, enabling mixed-fidelity
     # replay. Publishing one is a CLAIM only the strategy's author can make,

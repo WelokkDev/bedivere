@@ -13,6 +13,20 @@ dependencies = [
     "pydantic>=2.7",
 ]
 
+[project.optional-dependencies]
+# The bar lake (bedivere.data.lake, bedivere.data.vendor). Optional so a clone
+# that only replays a CSV can run the test suite and the example with no native
+# wheel at all.
+lake = [
+    "duckdb>=1.5",
+    # The Rust DBN decoder alone, NOT the `databento` client package — that one
+    # imports a heavy Arrow stack for functionality the lake does not use.
+    "databento-dbn>=0.65",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "requests>=2.32",
+]
+
 [project.scripts]
 bedivere-backtest = "bedivere.cli.backtest:main"
 bedivere-live = "bedivere.cli.live:main"
@@ -42,8 +56,6 @@ include = [
     "/src/bedivere",
     "/tests",
     "/examples",
-    "/specs",
-    "/docs",
     "/conftest.py",
     "/README.md",
     "/LICENSE",

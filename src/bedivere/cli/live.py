@@ -1,7 +1,7 @@
 """`python -m bedivere.live` — run a spec against live bars.
 
-    python -m bedivere.live --spec specs/x.json --mode shadow --until 15:55
-    python -m bedivere.live --spec specs/x.json --mode paper  --notify auto
+    python -m bedivere.live --spec my-spec.json --mode shadow --until 15:55
+    python -m bedivere.live --spec my-spec.json --mode paper  --notify auto
 
 Same spec file as the backtest. That is the design goal made operational: the
 window is the one thing a live run cannot inherit (a backtest's window is

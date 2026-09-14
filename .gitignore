@@ -26,6 +26,11 @@ prompt-*.md
 *.sqlite
 *.sqlite3
 
+# Vendor archives. Large and licensed, but they are the provenance root of
+# every lake partition derived from them — keep them locally, never in git.
+*.dbn
+*.dbn.zst
+
 # Secrets
 .env
 .env.*

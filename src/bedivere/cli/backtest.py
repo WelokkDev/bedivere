@@ -1,7 +1,7 @@
 """`python -m bedivere.backtest` — run a spec, archive the result.
 
-    python -m bedivere.backtest --spec specs/sma_cross.json --out runs/
-    python -m bedivere.backtest --spec specs/sma_cross.json --set rr=2.5
+    python -m bedivere.backtest --spec my-spec.json --out runs/
+    python -m bedivere.backtest --spec my-spec.json --set rr=2.5
 
 The composition is `bedivere.run.backtest.run_backtest`; this module's whole
 job is turning a JSON document into its arguments and putting the answer
@@ -73,7 +73,7 @@ def _sparse_stream(
             f'this spec asks for replay.mode "sparse", but the strategy plugin for '
             f'"{run.kind}" publishes no trigger_rule. Only the strategy\'s author can '
             "declare that its arming condition is decidable from coarse bars alone — "
-            "see docs/backtest-fidelity.md"
+            "see the bedivere.streams.sparse module docstring for the precondition"
         )
     if coarse_tf not in run.spec.derived_timeframes:
         raise CliError(

@@ -1,9 +1,9 @@
 """bedivere.streams.sparse — window selection, mixed-fidelity emission, guards.
 
-The end-to-end gate lives in test_sparse_parity.py. This file pins the
-pieces: that the pre-pass is causal, that windows clamp and merge and carry
-the way the docstrings claim, that the stream emits one contiguous ascending
-series across a resolution change, and that both guards fire.
+This file pins the pieces: that the pre-pass is causal, that windows clamp
+and merge and carry the way the docstrings claim, that the stream emits one
+contiguous ascending series across a resolution change, and that both guards
+fire.
 """
 
 from __future__ import annotations
