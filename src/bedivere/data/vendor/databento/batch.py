@@ -14,6 +14,10 @@ ingest downstream would succeed over the fraction that arrived. Keep the
 archives: a partition is a whole-file replacement derived from one, so the
 `.dbn.zst` is what makes the lake reproducible.
 
+Each job downloads into its own `<dest>/<job id>/`, as the vendor's client
+does: every job ships a `manifest.json` under that same name, so in a shared
+directory a later job would replace the manifest that vouches for an earlier one.
+
 Against the documented v0 Historical REST API (`hist.databento.com/v0`), auth by
 API key as the basic-auth username. Every call here — pricing, the submit,
 polling, file listing and the verified download — has been run end to end
@@ -411,7 +415,7 @@ def download_job(
     api_key: str | None = None,
     overwrite: bool = False,
 ) -> list[Path]:
-    """Download every file of a completed job into `dest_dir`, verified.
+    """Download every file of a completed job into `dest_dir/<job id>/`, verified.
 
     The job's state is read first, so a job still being prepared is refused by
     name rather than as an empty file list, and an expired one — whose files
@@ -421,6 +425,9 @@ def download_job(
     interrupted download is resumed by re-running the same command. `overwrite`
     re-fetches regardless, for the case where the vendor reissued the range.
     """
+    # Joined onto a local directory below, so a traversal must not survive.
+    if "/" in job_id or "\\" in job_id or job_id in ("", ".", ".."):
+        raise DatabentoApiError(f"refusing a job id that is not a plain name: {job_id!r}")
     job = find_job(job_id, api_key=api_key)
     if job.state == EXPIRED:
         raise DatabentoApiError(
@@ -438,8 +445,17 @@ def download_job(
         raise DatabentoApiError(
             f"batch job {job_id} is {DONE!r} but lists no files — nothing to download"
         )
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    return [_download_one(f, dest_dir, api_key, overwrite) for f in files]
+    job_dir = dest_dir / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        return [_download_one(f, job_dir, api_key, overwrite) for f in files]
+    except BaseException:
+        # If nothing arrived, leave no empty directory to be taken for a download.
+        try:
+            job_dir.rmdir()
+        except OSError:
+            pass
+        raise
 
 
 def _download_one(

@@ -13,6 +13,9 @@ them:
 Session geometry is handed over, never derived — this module decides nothing
 about when a session starts, exactly like the rest of the engine.
 
+A file must also arrive whole: `stream_dbn` refuses one that stops inside a
+record or a zstd frame, which the vendor decoder alone reads as fewer records.
+
 No forward-fill: a second with no trades prints no record and we write no row,
 because absence of a bar means absence of trades and a cloned bar would replay
 its high/low range into a quiet stretch. Writes go through the one seam,
@@ -35,7 +38,6 @@ from bedivere.core.session_days import SessionDay, SessionDays
 from bedivere.core.types import Timeframe
 from bedivere.data.lake.layout import RollRule, SeriesId
 from bedivere.data.lake.schema import BarBatch
-from bedivere.data.lake.writer import write_day
 
 PRICE_SCALE: Final[int] = 1_000_000_000
 NS_PER_SEC: Final[int] = 1_000_000_000
@@ -65,29 +67,183 @@ class IngestError(Exception):
     """The file cannot be ingested as the series it was declared to be."""
 
 
-def _compression_of(path: Path) -> databento_dbn.Compression:
-    # The stubs type the enum members as `str`, but the runtime objects are
-    # Compression variants — hence the casts.
-    if path.name.endswith(".dbn.zst") or path.name.endswith(".zst"):
-        return cast("databento_dbn.Compression", databento_dbn.Compression.ZSTD)
+def is_zstd(path: Path) -> bool:
+    """Whether `path` is named as zstd-compressed DBN; compression is never sniffed."""
+    if path.name.endswith(".zst"):
+        return True
     if path.name.endswith(".dbn"):
-        return cast("databento_dbn.Compression", databento_dbn.Compression.NONE)
+        return False
     raise IngestError(f"{path.name}: not a .dbn or .dbn.zst file")
 
 
-def _stream(path: Path) -> Iterator[object]:
-    """Every DBN record in `path`, `Metadata` first, streamed chunk-wise so
-    memory stays flat regardless of file size."""
-    decoder = databento_dbn.DBNDecoder(compression=_compression_of(path))
+class ZstdFrames:
+    """Walks zstd frame and block headers (RFC 8878) to see where frames end.
+
+    The vendor decoder reports nothing when a compressed archive stops short.
+    Reading headers only is cheap and shows whether the input ended on a frame
+    boundary; a file cut exactly between two frames still looks complete.
+    """
+
+    __slots__ = ("_checksum", "_name", "_need", "_part", "_skip", "_state", "_then", "frames")
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._state = "magic"
+        self._need = 4
+        self._part = bytearray()
+        self._skip = 0
+        self._then = "magic"
+        self._checksum = False
+        self.frames = 0
+
+    def complete(self) -> bool:
+        return self.frames > 0 and self._state == "magic" and not self._part and not self._skip
+
+    def require_complete(self) -> None:
+        """Call once the input is exhausted: it must have ended on a frame boundary."""
+        if not self.complete():
+            raise IngestError(
+                f"{self._name}: incomplete trailing zstd frame; the archive is truncated"
+            )
+
+    def feed(self, data: bytes) -> None:
+        pos, end = 0, len(data)
+        while pos < end:
+            if self._skip:
+                step = min(self._skip, end - pos)
+                self._skip -= step
+                pos += step
+                if not self._skip:
+                    self._enter(self._then)
+                continue
+            take = min(self._need - len(self._part), end - pos)
+            self._part += data[pos : pos + take]
+            pos += take
+            if len(self._part) == self._need:
+                field = bytes(self._part)
+                self._part.clear()
+                self._parse(field)
+
+    def _expect(self, state: str, size: int) -> None:
+        self._state, self._need = state, size
+
+    def _skip_then(self, count: int, state: str) -> None:
+        self._state, self._skip, self._then = "skip", count, state
+        if not count:
+            self._enter(state)
+
+    def _enter(self, state: str) -> None:
+        if state == "checksum":
+            self._skip_then(4, "frame_end")
+        elif state == "frame_end":
+            self.frames += 1
+            self._expect("magic", 4)
+        else:
+            self._expect(state, 3 if state == "block" else 4)
+
+    def _parse(self, field: bytes) -> None:
+        value = int.from_bytes(field, "little")
+        if self._state == "magic":
+            if value == 0xFD2FB528:
+                self._expect("descriptor", 1)
+            elif value & 0xFFFFFFF0 == 0x184D2A50:
+                self._expect("skippable", 4)
+            else:
+                raise IngestError(
+                    f"{self._name}: compressed archive is not a sequence of zstd frames"
+                )
+        elif self._state == "descriptor":
+            if value & 0x08:
+                raise IngestError(f"{self._name}: zstd frame header sets a reserved bit")
+            single = bool(value & 0x20)
+            self._checksum = bool(value & 0x04)
+            header = (
+                (0 if single else 1)
+                + (0, 1, 2, 4)[value & 0x03]
+                + ((1 if single else 0), 2, 4, 8)[value >> 6]
+            )
+            self._skip_then(header, "block")
+        elif self._state == "block":
+            kind = (value >> 1) & 0x03
+            if kind == 3:
+                raise IngestError(f"{self._name}: zstd block uses the reserved block type")
+            last = value & 0x01
+            then = "block" if not last else "checksum" if self._checksum else "frame_end"
+            self._skip_then(1 if kind == 1 else value >> 3, then)
+        else:  # skippable frame: its length, then its payload
+            self._skip_then(value, "magic")
+
+
+class CheckedDecoder:
+    """The vendor decoder, plus the end-of-input checks it does not make.
+
+    `finish`, called once the input is exhausted, refuses one that stopped
+    inside a DBN record or, when compressed, inside a zstd frame.
+    """
+
+    __slots__ = ("_decoder", "_frames", "_name")
+
+    def __init__(self, name: str, *, zstd: bool) -> None:
+        # The stubs type the enum members as `str`, but the runtime objects are
+        # Compression variants — hence the cast.
+        compression = databento_dbn.Compression.ZSTD if zstd else databento_dbn.Compression.NONE
+        self._name = name
+        self._decoder = databento_dbn.DBNDecoder(
+            compression=cast("databento_dbn.Compression", compression)
+        )
+        self._frames = ZstdFrames(name) if zstd else None
+
+    @property
+    def zstd(self) -> bool:
+        return self._frames is not None
+
+    def feed(self, chunk: bytes) -> list[object]:
+        if self._frames is not None:
+            self._frames.feed(chunk)
+        try:
+            self._decoder.write(chunk)
+            return cast("list[object]", self._decoder.decode())
+        except (databento_dbn.DBNError, RuntimeError) as e:
+            # Damaged zstd data leaves the vendor decoder as a bare RuntimeError.
+            raise IngestError(f"{self._name}: {e}") from e
+
+    def finish(self) -> None:
+        if self._decoder.buffer():
+            raise IngestError(f"{self._name}: incomplete trailing DBN record")
+        if self._frames is not None:
+            self._frames.require_complete()
+
+
+def check_frames(path: Path) -> None:
+    """Refuse a compressed file that stops inside a zstd frame, reading headers
+    only: for a caller that must refuse before acting on the first record."""
+    if not is_zstd(path):
+        return
+    frames = ZstdFrames(path.name)
     with path.open("rb") as fh:
         while chunk := fh.read(_CHUNK_BYTES):
-            decoder.write(chunk)
-            yield from cast("list[object]", decoder.decode())
+            frames.feed(chunk)
+    frames.require_complete()
+
+
+def stream_dbn(path: Path, *, zstd: bool | None = None) -> Iterator[object]:
+    """Every DBN record in `path`, `Metadata` first, streamed chunk-wise so
+    memory stays flat regardless of file size.
+
+    Only exhausting the stream proves the file whole; a caller that stops early
+    has checked nothing. `zstd` overrides the name for a file not yet under its
+    final name.
+    """
+    decoder = CheckedDecoder(path.name, zstd=is_zstd(path) if zstd is None else zstd)
+    with path.open("rb") as fh:
+        while chunk := fh.read(_CHUNK_BYTES):
+            yield from decoder.feed(chunk)
+    decoder.finish()
 
 
 def read_metadata(path: Path) -> databento_dbn.Metadata:
     """The DBN header. Cheap: decoding stops at the first batch."""
-    for rec in _stream(path):
+    for rec in stream_dbn(path):
         if isinstance(rec, databento_dbn.Metadata):
             return rec
         raise IngestError(f"{path.name}: first DBN record is {type(rec).__name__}, not Metadata")
@@ -169,8 +325,9 @@ def check_complete(path: Path, *, max_trailing_gap_days: float = 4.0) -> Observe
     """Refuse a DBN file whose records stop well short of its declared range.
 
     An interrupted download keeps its truthful header while holding only the
-    bytes that arrived, so everything downstream succeeds over the fraction that
-    made it. The tolerance allows a real trailing gap (a range ending on a
+    bytes that arrived. `stream_dbn` refuses a cut inside a zstd frame; this
+    catches what that cannot see, such as an uncompressed file cut between two
+    records. The tolerance allows a real trailing gap (a range ending on a
     Friday, a holiday weekend) but not a truncation.
     """
     declared = read_range(path)
@@ -273,7 +430,7 @@ def _ohlcv_records(path: Path) -> Iterator[databento_dbn.OHLCVMsg]:
     """OHLCV records only. A DBN stream also carries symbol-mapping, system and
     error records, and treating one of those as a bar would read whatever sits at
     those struct offsets."""
-    for rec in _stream(path):
+    for rec in stream_dbn(path):
         if isinstance(rec, databento_dbn.OHLCVMsg):
             yield rec
 
@@ -401,7 +558,20 @@ def ingest_dbn(
     Records arrive in time order, so days are flushed as the walk crosses each
     boundary and memory stays at one session-day however long the file is.
     """
-    symbology = build_symbology(read_metadata(path))
+    # Imported here: the writer needs pandas, and lake.trades uses this module without it.
+    from bedivere.data.lake.writer import source_range_metadata, write_day
+
+    # Days are written as the walk passes them, so refuse a truncated file first.
+    check_frames(path)
+    meta = read_metadata(path)
+    symbology = build_symbology(meta)
+    # Every partition keeps the header's range, so a partly covered session can
+    # be told from a whole one. A record limit or open end vouches for nothing.
+    covered = (
+        source_range_metadata(meta.start, meta.end)
+        if meta.end and not meta.limit and 0 <= meta.start < meta.end < 2**63
+        else None
+    )
     period = timeframe.period_seconds
     resolve = days.make_resolver()
     index_of = {day.label: i for i, day in enumerate(days.days)}
@@ -420,7 +590,10 @@ def ingest_dbn(
             buffer = _DayBuffer()
             return
         if not dry_run:
-            write_day(root, sid, timeframe, current.label, buffer.batch, source=path.name)
+            write_day(
+                root, sid, timeframe, current.label, buffer.batch, source=path.name,
+                extra_metadata=covered,
+            )
         days_written += 1
         bars_written += len(buffer)
         buffer = _DayBuffer()

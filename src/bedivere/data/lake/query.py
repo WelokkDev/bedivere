@@ -8,9 +8,11 @@ DuckDB reads the Parquet in place, and the Hive layout makes the partition keys
       FROM bars WHERE symbol='NQ' AND tf='1s' AND session >= '2026-06-01'
       GROUP BY session ORDER BY session"
 
-Two views are registered: `bars` (every bar plus the partition keys and a
-readable `ts_utc`) and `condition` (the vendor's per-UTC-date quality feed).
-Read-only by convention — writing goes through `lake.writer`.
+Three views are registered: `bars` (every bar plus the partition keys and a
+readable `ts_utc`), `volume_bars` (the event-bar datasets, with theirs) and
+`condition` (the vendor's per-UTC-date quality feed). Each exists, empty, when
+the lake holds nothing for it. Read-only by convention — writing goes through
+`lake.writer`.
 """
 
 from __future__ import annotations
@@ -20,6 +22,8 @@ from pathlib import Path
 from typing import Final
 
 import duckdb
+
+from bedivere.data.lake.schema import BAR_COLUMNS
 
 LAKE_ROOT_ENV: Final[str] = "BEDIVERE_LAKE_ROOT"
 
@@ -51,7 +55,8 @@ def lake_root(root: Path | None = None) -> Path:
 
 
 def connect(root: Path | None = None) -> duckdb.DuckDBPyConnection:
-    """An in-memory DuckDB with `bars` and `condition` views over the lake."""
+    """An in-memory DuckDB with `bars`, `volume_bars` and `condition` views
+    over the lake."""
     base = lake_root(root)
     conn = duckdb.connect(":memory:")
 
@@ -67,10 +72,27 @@ def connect(root: Path | None = None) -> duckdb.DuckDBPyConnection:
         )
     else:
         # An empty lake must still answer queries, or every caller needs its
-        # own "is there anything there yet" branch.
+        # own "is there anything there yet" branch. Same columns as the stored view.
+        columns = ", ".join(f'NULL::{c.duck_type} AS "{c.name}"' for c in BAR_COLUMNS)
+        keys = _partition_keys("dataset", "series", "session", "symbol", "tf")
         conn.execute(
-            "CREATE VIEW bars AS SELECT NULL::BIGINT ts, NULL::VARCHAR symbol WHERE false"
+            f'CREATE VIEW bars AS SELECT {columns}, {keys}, NULL::TIMESTAMPTZ AS "ts_utc" WHERE false'
         )
+
+    from bedivere.data.lake.volume_store import COLUMNS
+
+    event_dir = base / "event_bars"
+    if _has_parquet(event_dir):
+        glob = (event_dir / "**" / "*.parquet").as_posix().replace("'", "''")
+        conn.execute(
+            "CREATE VIEW volume_bars AS SELECT * "
+            f"FROM read_parquet('{glob}', hive_partitioning=true)"
+        )
+    else:
+        # Quoted and with AS: the parser rejects `close` and `session` as bare aliases.
+        columns = ", ".join(f'NULL::{kind} AS "{name}"' for name, kind in COLUMNS.items())
+        keys = _partition_keys("dataset", "definition", "series", "session", "symbol")
+        conn.execute(f"CREATE VIEW volume_bars AS SELECT {columns}, {keys} WHERE false")
 
     cond_dir = base / "_meta" / "condition"
     if _has_parquet(cond_dir):
@@ -87,6 +109,14 @@ def connect(root: Path | None = None) -> duckdb.DuckDBPyConnection:
             "SELECT NULL::VARCHAR date, NULL::VARCHAR condition WHERE false"
         )
     return conn
+
+
+def _partition_keys(*names: str) -> str:
+    """Partition-key columns for an empty stand-in view, as hive partitioning
+    returns them: in name order, with `session` a DATE."""
+    return ", ".join(
+        f'NULL::{"DATE" if name == "session" else "VARCHAR"} AS "{name}"' for name in names
+    )
 
 
 def _has_parquet(directory: Path) -> bool:

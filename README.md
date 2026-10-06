@@ -92,6 +92,35 @@ working directory (gitignored), without overriding anything already set:
 echo 'DATABENTO_API_KEY=db-...' >> .env
 ```
 
+For offline ML research, `bedivere-data volume` also builds volume bars from
+local Databento trades, or approximates them from stored one-second bars:
+
+```bash
+bedivere-data volume --spec my-spec.json --from 1s --threshold 5000
+bedivere-data volume --spec my-spec.json --archive archives/trades.dbn.zst \
+  --threshold 5000 --compare-1s
+```
+
+These are separate Parquet event-bar datasets with nanosecond timestamps and
+explicit construction policies, available through the `volume_bars` SQL view.
+The one-second approximation `--compare-1s` rebuilds from the archive's own
+trades is a dataset of its own too, kept apart from the stored-seconds one the
+first command builds.
+See [volume-bar construction and comparison](docs/volume-bars.md) for archive
+preparation (including MBO trade extraction), resumable builds, validated pandas
+loading, and availability-aware joins. An optional `--boundary nearest_second`
+policy for stored `1s` data reduces cumulative boundary drift while retaining
+whole candles; it has distinct volume and availability semantics. No strategy
+specification is required
+when supplying a session calendar and series directly. Engine
+replay still uses fixed-duration timeframes. The individual trades behind
+those bars (exact prices, both clocks, vendor side codes and flags) are
+readable through a validated, streaming Python API; see
+[trade records](docs/trade-data.md). A
+[decision-time context API](docs/volume-bars.md#decision-time-context) returns,
+per decision timestamp, the completed-bar history, the trades of a causal
+window, and the forming bar replayed under the stored construction policy.
+
 ## Architecture
 
 One JSON envelope fully describes a run: strategy, symbol, config, timeframes,

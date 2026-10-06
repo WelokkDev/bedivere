@@ -12,8 +12,10 @@
     # without --wait it submits and prints the job id; download that job later
     bedivere-data fetch --job GLBX-20260101-XXXXXXXXXX --dest archives/
 
-    # decode it into the lake, and derive every coarser rung
-    bedivere-data ingest --archive archives/glbx-...ohlcv-1s.dbn.zst --spec my-spec.json
+    # each job lands in its own archives/<job id>/; decode it into the lake,
+    # and derive every coarser rung
+    bedivere-data ingest --spec my-spec.json \
+        --archive archives/GLBX-20260101-XXXXXXXXXX/glbx-...ohlcv-1s.dbn.zst
 
     # what is in there, and is any derived timeframe short?
     bedivere-data list
@@ -114,11 +116,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     der.add_argument("--dry-run", action="store_true")
 
+    vol = with_root(sub.add_parser("volume", help="build volume bars for offline ML research"))
+    vol.add_argument("--spec", type=Path, help="spec envelope for the session calendar")
+    vol.add_argument("--session", type=Path, help="resolved session-day rows as JSON")
+    vol.add_argument("--symbol", help="root symbol (default: the spec's)")
+    vol.add_argument("--dataset")
+    vol.add_argument("--series", help="raw.<CONTRACT>, or an existing series with 1s contract identity")
+    source = vol.add_mutually_exclusive_group(required=True)
+    source.add_argument("--archive", type=Path, help="local Databento trades DBN covering full sessions")
+    source.add_argument("--from", dest="source_tf", choices=["1s"],
+                        help="approximate from stored one-second bars (source ohlcv-1s)")
+    vol.add_argument("--threshold", required=True, type=int, help="contracts per volume bar")
+    vol.add_argument("--boundary", choices=["whole_trade", "split_trade", "nearest_second"],
+                     default="whole_trade", help="nearest_second is only for --from 1s")
+    vol.add_argument("--compare-1s", action="store_true",
+                     help="also build and summarize the 1s approximation from the same trades "
+                     "(source trades-1s: a dataset of its own, never a --from 1s one)")
+    vol.add_argument("--approx-boundary", choices=["whole_trade", "nearest_second"],
+                     default="whole_trade", help="boundary policy for --compare-1s")
+    vol.add_argument("--dry-run", action="store_true", help="compute diagnostics without writing")
+    vol.add_argument("--resume", action="store_true",
+                     help="verify and skip partitions whose input fingerprints have not changed")
+
+    prep = with_root(sub.add_parser("prepare-trades", help="extract and cache trades from local DBN files"))
+    prep.add_argument("--archive", type=Path, required=True,
+                      help="a trades/MBO file or directory of contiguous daily DBN files")
+
     # ---------- looking at it ----------
 
     with_root(sub.add_parser("list", help="every series in the lake, and its lineage"))
 
-    q = with_root(sub.add_parser("sql", help="run SQL over the lake (views: bars, condition)"))
+    q = with_root(sub.add_parser("sql", help="run SQL (views: bars, volume_bars, condition)"))
     q.add_argument("query", nargs="?", help="SQL to run (default: a coverage summary)")
     q.add_argument("--limit", type=int, default=40, help="max rows to print (default 40)")
 
@@ -146,7 +174,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         help="refuse to submit above this many USD. Required unless --job is given",
     )
-    fetch.add_argument("--dest", type=Path, required=True, help="directory to download into")
+    fetch.add_argument(
+        "--dest",
+        type=Path,
+        required=True,
+        help="directory to download into; each job gets its own <dest>/<job id>/, so one "
+        "--dest serves any number of jobs",
+    )
     fetch.add_argument(
         "--job",
         help="download an EXISTING job id instead of submitting a new one "
@@ -226,6 +260,8 @@ def _dispatch(args: argparse.Namespace) -> int:
     handlers = {
         "ingest": _ingest,
         "derive": _derive,
+        "volume": _volume,
+        "prepare-trades": _prepare_trades,
         "list": _list,
         "sql": _sql,
         "coverage": _coverage,
@@ -401,6 +437,50 @@ def _derive(args: argparse.Namespace) -> int:
     return _report_inventory(catalog, root)
 
 
+def _volume(args: argparse.Namespace) -> int:
+    import json
+
+    build = lake_module("volume_build")
+    volume = lake_module("volume")
+    schema = lake_module("schema")
+    import duckdb
+    days = _session_days(args)
+    sid = _series_id(*_series_defaults(args))
+    root = _lake_root(args)
+    try:
+        if args.compare_1s and not args.archive:
+            raise ValueError("--compare-1s requires --archive")
+        if args.approx_boundary != "whole_trade" and not args.compare_1s:
+            raise ValueError("--approx-boundary requires --compare-1s")
+        spec = volume.VolumeSpec(
+            args.threshold, "trades" if args.archive else f"ohlcv-{args.source_tf}", args.boundary,
+        )
+        if args.archive:
+            reports = build.build_volume_archive(
+                args.archive, root, sid, spec, days,
+                compare_1s=args.compare_1s, dry_run=args.dry_run, resume=args.resume,
+                approx_boundary=args.approx_boundary,
+            )
+        else:
+            reports = build.derive_volume(root, sid, spec, days, dry_run=args.dry_run, resume=args.resume)
+    except (ValueError, OSError, build.IngestError, schema.BarSchemaError, duckdb.Error) as e:
+        raise CliError(str(e)) from e
+    sys.stdout.write(json.dumps(reports, indent=2) + "\n")
+    return 0
+
+
+def _prepare_trades(args: argparse.Namespace) -> int:
+    module = lake_module("trade_archive")
+    try:
+        path = module.prepare_trade_archive(
+            args.archive, _lake_root(args) / "_meta" / "trade_cache", progress=note,
+        )
+    except (ValueError, OSError, module.IngestError) as e:
+        raise CliError(str(e)) from e
+    sys.stdout.write(str(path) + "\n")
+    return 0
+
+
 def _report_inventory(catalog: Any, root: Path) -> int:
     """The inventory, then the lineage check. Exit 1 on an incomplete rung —
     a derive that stopped early leaves every file valid and the series short."""
@@ -417,15 +497,23 @@ def _report_inventory(catalog: Any, root: Path) -> int:
 
 def _print_inventory(catalog: Any, root: Path) -> None:
     entries = catalog.inventory(root)
-    if not entries:
+    event_entries = lake_module("volume_store").volume_inventory(root)
+    if not entries and not event_entries:
         sys.stdout.write(f"{root} holds no bars\n")
         return
-    sys.stdout.write(f"{'SERIES':<34} {'TF':<5} {'DAYS':>6}  SOURCE\n")
+    if entries:
+        sys.stdout.write(f"{'SERIES':<34} {'TF':<5} {'DAYS':>6}  SOURCE\n")
     for entry in entries:
         sys.stdout.write(
             f"{str(entry.series):<34} {entry.timeframe.value:<5} "
             f"{entry.session_days:>6}  {entry.source}\n"
         )
+    if event_entries:
+        import json
+
+        sys.stdout.write("\nVolume-bar datasets (offline research):\n")
+        for entry in event_entries:
+            sys.stdout.write(json.dumps(entry, sort_keys=True) + "\n")
 
 
 # ---------- looking at it ----------
@@ -613,7 +701,7 @@ def _fetch(args: argparse.Namespace) -> int:
             note(f"waiting up to {args.wait:.0f}s for job {job_id} ...")
             job = batch.wait_for_job(job_id, clock=LiveClock(), timeout_seconds=args.wait)
             note(f"          {job.describe()}")
-        note(f"downloading job {job_id} -> {args.dest}")
+        note(f"downloading job {job_id} -> {args.dest / job_id}")
         paths = batch.download_job(job_id, args.dest)
     except (batch.DatabentoApiError, ValueError, OSError) as e:
         raise CliError(str(e)) from e

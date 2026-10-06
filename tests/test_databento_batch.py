@@ -9,6 +9,7 @@ a download that does not match what the API published never becomes visible.
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 import types
 from pathlib import Path
@@ -337,7 +338,7 @@ def test_a_verified_download_lands_under_its_real_name(api: Any, tmp_path: Path)
     )
     (path,) = batch.download_job(JOB["id"], tmp_path / "archives")
     assert path.read_bytes() == body
-    assert path.name == "nq.dbn.zst"
+    assert path == tmp_path / "archives" / JOB["id"] / "nq.dbn.zst"  # the job's own directory
     assert list(path.parent.glob("*.part")) == []  # no temp left behind
 
 
@@ -379,7 +380,8 @@ def test_an_already_verified_file_is_not_re_fetched(api: Any, tmp_path: Path) ->
             **DETAILS,
         }
     )
-    (tmp_path / "nq.dbn.zst").write_bytes(body)
+    (tmp_path / JOB["id"]).mkdir()
+    (tmp_path / JOB["id"] / "nq.dbn.zst").write_bytes(body)
     batch.download_job(JOB["id"], tmp_path)
     assert [url for _, url, _ in fake.calls if "download" in url] == []
 
@@ -393,9 +395,90 @@ def test_a_present_but_wrong_file_is_re_fetched(api: Any, tmp_path: Path) -> Non
             **DETAILS,
         }
     )
-    (tmp_path / "nq.dbn.zst").write_bytes(b"stale")
+    (tmp_path / JOB["id"]).mkdir()
+    (tmp_path / JOB["id"] / "nq.dbn.zst").write_bytes(b"stale")
     (path,) = batch.download_job(JOB["id"], tmp_path)
     assert path.read_bytes() == body
+
+
+def _job_files(job_id: str, archive: str, data: bytes) -> tuple[list[dict[str, Any]], dict[str, bytes]]:
+    """A job as the vendor lists it: its archive, and the manifest naming that archive."""
+    entry = _file_payload(data, name=archive)
+    manifest = json.dumps({"job_id": job_id, "files": [entry]}).encode()
+    bodies = {archive: data, "manifest.json": manifest}
+    listing = [entry, _file_payload(manifest, name="manifest.json")]
+    for payload in listing:
+        payload["urls"] = {"https": f"https://hist/v0/batch/download/{job_id}/{payload['filename']}"}
+    return listing, bodies
+
+
+SAME_NAME = "glbx-mdp3-20260824.mbo.dbn.zst"
+
+
+def _two_jobs_fetched(monkeypatch: pytest.MonkeyPatch, dest: Path) -> dict[str, dict[str, bytes]]:
+    """Two jobs downloaded into `dest`, one after the other: what each one holds."""
+    monkeypatch.setenv("DATABENTO_API_KEY", KEY)
+    jobs = {
+        "GLBX-20260909-AAAAAAAAAA": _job_files("GLBX-20260909-AAAAAAAAAA", SAME_NAME, b"NQ"),
+        "GLBX-20260910-BBBBBBBBBB": _job_files("GLBX-20260910-BBBBBBBBBB", SAME_NAME, b"ES, longer"),
+    }
+
+    def get(url: str, **kwargs: Any) -> FakeResponse:
+        asked = str(dict(kwargs.get("params") or {}).get("job_id"))
+        if "batch.list_files" in url:
+            return FakeResponse(jobs[asked][0])
+        if "batch/download" in url:
+            _, job_id, name = url.rsplit("/", 2)
+            return FakeResponse(body=jobs[job_id][1][name])
+        return FakeResponse({**JOB, "id": asked})
+
+    module = types.ModuleType("requests")
+    module.get = get  # pyright: ignore[reportAttributeAccessIssue]
+    monkeypatch.setitem(sys.modules, "requests", module)
+
+    for job_id in jobs:
+        batch.download_job(job_id, dest)
+    # Fetched again, the first job finds its files where it left them.
+    first = next(iter(jobs))
+    assert all(path.parent == dest / first for path in batch.download_job(first, dest))
+    return {job_id: bodies for job_id, (_, bodies) in jobs.items()}
+
+
+def test_two_jobs_into_one_destination_keep_their_own_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dest = tmp_path / "archives"
+    jobs = _two_jobs_fetched(monkeypatch, dest)
+    assert sorted(path.name for path in dest.iterdir()) == sorted(jobs)
+    for job_id, bodies in jobs.items():
+        assert (dest / job_id / SAME_NAME).read_bytes() == bodies[SAME_NAME]
+        manifest = json.loads((dest / job_id / "manifest.json").read_text())
+        (listed,) = manifest["files"]
+        assert manifest["job_id"] == job_id
+        assert listed["hash"] == "sha256:" + hashlib.sha256(bodies[SAME_NAME]).hexdigest()
+
+
+def test_each_jobs_archive_still_passes_its_vendor_manifest_after_another_fetch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pytest.importorskip("databento_dbn", reason="the lake extra is not installed")
+    from bedivere.data.lake.trade_archive import verify_manifest
+
+    dest = tmp_path / "archives"
+    for job_id, bodies in _two_jobs_fetched(monkeypatch, dest).items():
+        # The strict check, unchanged: listed exactly once, same size and SHA256.
+        digest = hashlib.sha256(bodies[SAME_NAME]).hexdigest()
+        assert verify_manifest(dest / job_id / SAME_NAME, digest) is True
+
+
+def test_a_job_id_that_is_not_a_plain_name_is_refused_before_any_request(
+    api: Any, tmp_path: Path
+) -> None:
+    fake = api()
+    for job_id in ("../escape", "sub/job", "..", ""):
+        with pytest.raises(DatabentoApiError, match="not a plain name"):
+            batch.download_job(job_id, tmp_path)
+    assert fake.calls == [] and list(tmp_path.iterdir()) == []
 
 
 def test_a_filename_that_is_not_a_plain_name_is_refused(api: Any, tmp_path: Path) -> None:

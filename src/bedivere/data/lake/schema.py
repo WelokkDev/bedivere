@@ -38,6 +38,12 @@ META_SESSION: Final[str] = "bedivere.session"
 META_SOURCE: Final[str] = "bedivere.source"
 META_PRICE_BASIS: Final[str] = "bedivere.price_basis"
 
+# The `[start, end)` Unix-nanosecond range a source declares it covers. The bars
+# cannot say this: a partition starting hours into its session looks like a
+# quiet open. A footer without these keys claims no coverage.
+META_SOURCE_START_NS: Final[str] = "bedivere.source_start_ns"
+META_SOURCE_END_NS: Final[str] = "bedivere.source_end_ns"
+
 AS_TRADED: Final[str] = "as_traded"
 """The only basis the lake STORES. A persisted back-adjusted series changes
 value at every subsequent roll, which is how two backtests six months apart come

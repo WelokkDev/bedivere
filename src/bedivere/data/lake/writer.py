@@ -1,6 +1,6 @@
-"""The ONE write seam for lake partitions — validated, atomic, verified.
+"""The write seam for time-bar lake partitions — validated, atomic, verified.
 
-Every partition that reaches disk goes through `write_day`: value-level
+Every time-bar partition that reaches disk goes through `write_day`: value-level
 invariants (strictly-ascending close stamps, finite prices, non-negative volume,
 uint32 instrument ids) refused loudly and never repaired, footer provenance
 stamped in, temp-then-rename, and a read-back check before the rename so a file
@@ -35,6 +35,8 @@ from bedivere.data.lake.schema import (
     META_SERIES,
     META_SESSION,
     META_SOURCE,
+    META_SOURCE_END_NS,
+    META_SOURCE_START_NS,
     META_SYMBOL,
     META_TIMEFRAME,
     BarBatch,
@@ -89,6 +91,13 @@ def partition_metadata(
         }
     )
     return meta
+
+
+def source_range_metadata(start_ns: int, end_ns: int) -> dict[str, str]:
+    """`extra_metadata` recording the `[start_ns, end_ns)` range a source covered."""
+    if type(start_ns) is not int or type(end_ns) is not int or not 0 <= start_ns < end_ns < 2**63:
+        raise LakeWriteError("a source range is integer Unix nanoseconds with start < end")
+    return {META_SOURCE_START_NS: str(start_ns), META_SOURCE_END_NS: str(end_ns)}
 
 
 def _validate(batch: BarBatch, context: str) -> None:

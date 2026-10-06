@@ -26,6 +26,7 @@ from bedivere.data.lake.ingest import (  # noqa: E402
     OUTRIGHT,
     IngestError,
     SymbolResolver,
+    ZstdFrames,
     build_symbology,
     causal_front_months,
     check_complete,
@@ -34,9 +35,23 @@ from bedivere.data.lake.ingest import (  # noqa: E402
     observed_range,
     read_range,
 )
-from bedivere.data.lake.layout import RollRule, local_continuous, stored_labels  # noqa: E402
-from bedivere.data.lake.read import read_bars, read_table, roll_boundaries  # noqa: E402
+from bedivere.data.lake.layout import (  # noqa: E402
+    RollRule,
+    local_continuous,
+    session_path,
+    stored_labels,
+)
+from bedivere.data.lake.read import (  # noqa: E402
+    read_bars,
+    read_table,
+    roll_boundaries,
+    source_range,
+)
+from bedivere.data.lake.volume import VolumeSpec  # noqa: E402
+from bedivere.data.lake.volume_build import derive_volume  # noqa: E402
+from bedivere.data.lake.volume_research import volume_coverage  # noqa: E402
 from tests.helpers import eth_session_days  # noqa: E402
+from tests.test_trades import bare_decode, zstd  # noqa: E402
 
 SID = local_continuous("GLBX.MDP3", "NQ", RollRule.VOLUME, 0)
 LABELS = ["2026-06-15", "2026-06-16", "2026-06-17"]
@@ -91,7 +106,9 @@ def write_dbn(
     *,
     mappings: list[Any] | None = None,
     dataset: str = "GLBX.MDP3",
+    declared_start_unix: int | None = None,
     declared_end_unix: int | None = None,
+    limit: int | None = None,
 ) -> Path:
     """A real, decodable DBN file: encoded header + fixed-size records.
 
@@ -101,8 +118,9 @@ def write_dbn(
     stamps = [r.ts_event // NS for r in records] or [0]
     meta = databento_dbn.Metadata(
         dataset=dataset,
-        start=min(stamps) * NS,
+        start=(declared_start_unix if declared_start_unix is not None else min(stamps)) * NS,
         end=(declared_end_unix if declared_end_unix is not None else max(stamps)) * NS,
+        limit=limit,
         stype_out=databento_dbn.SType.INSTRUMENT_ID,
         stype_in=databento_dbn.SType.PARENT,
         schema=databento_dbn.Schema.OHLCV_1S,
@@ -157,6 +175,60 @@ def test_check_complete_catches_a_truncated_download(tmp_path: Path) -> None:
 def test_a_file_with_no_bars_is_loud(tmp_path: Path) -> None:
     with pytest.raises(IngestError, match="no OHLCV records"):
         observed_range(write_dbn(tmp_path / "empty.dbn", []))
+
+
+def test_a_compressed_archive_cut_short_is_refused_inside_the_gap_tolerance(
+    tmp_path: Path,
+) -> None:
+    """The vendor decoder is silent, and `check_complete` admits the trailing
+    gap: only the container shows that such a file is not whole."""
+    records = [record for i in range(3) for record in _one_day_records(i, FRONT, 7_000)]
+    whole = zstd(write_dbn(tmp_path / "nq.dbn", records).read_bytes())
+    path = tmp_path / "nq.dbn.zst"
+    path.write_bytes(whole)
+    assert check_complete(path).records == len(records)
+    silent = [
+        cut
+        for cut in (len(whole) * k // 24 for k in range(1, 24))
+        for decoded, leftover in [bare_decode(whole[:cut])]
+        if 1 < decoded <= len(records) and not leftover
+    ]
+    assert silent  # or this fixture no longer holds the dangerous case
+    for cut in silent:
+        path.write_bytes(whole[:cut])
+        with pytest.raises(IngestError, match="incomplete trailing zstd frame"):
+            check_complete(path)
+        # Days are written as the walk passes them, so the refusal must come first.
+        with pytest.raises(IngestError, match="incomplete trailing zstd frame"):
+            ingest_dbn(path, tmp_path / "lake", SID, Timeframe.S1, DAYS)
+        assert not (tmp_path / "lake").exists()
+    # Damage, as opposed to truncation, is refused under the file's name as well.
+    damaged = bytearray(whole)
+    damaged[len(whole) // 2] ^= 0xFF
+    path.write_bytes(bytes(damaged))
+    with pytest.raises(IngestError, match="nq.dbn.zst: "):
+        observed_range(path)
+
+
+def test_the_frame_walk_misses_only_a_cut_exactly_between_two_frames(tmp_path: Path) -> None:
+    def walked(data: bytes) -> ZstdFrames:
+        frames = ZstdFrames("nq.dbn.zst")
+        for start in range(0, len(data), 7):  # header fields split across chunks
+            frames.feed(data[start : start + 7])
+        return frames
+
+    one = zstd(write_dbn(tmp_path / "nq.dbn", _one_day_records(0, FRONT, 40)).read_bytes())
+    both = one + one
+    assert (walked(one).frames, walked(both).frames) == (1, 2)
+    assert [cut for cut in range(len(both) + 1) if walked(both[:cut]).complete()] == [
+        len(one),
+        len(both),
+    ]
+    skippable = bytes.fromhex("502a4d18") + (5).to_bytes(4, "little") + b"notes"
+    assert walked(skippable + one + skippable).complete()
+    assert not walked(skippable).complete()  # no frame of data at all
+    with pytest.raises(IngestError, match="nq.dbn.zst: compressed archive is not a sequence"):
+        walked(one + b"\0" * 4)
 
 
 # ---------- symbology ----------
@@ -322,6 +394,56 @@ def test_one_partition_per_session_day(tmp_path: Path) -> None:
     assert report.days_written == 3
     assert report.bars_written == 12
     assert stored_labels(tmp_path / "lake", SID, Timeframe.S1) == LABELS
+
+
+def utc_bounded_download(tmp_path: Path, **header: Any) -> Path:
+    """Two UTC days of 1s bars: of three ETH sessions, only the second lies inside."""
+    midnight = DAYS.days[0].start_unix + 2 * 3600
+    records = [_record(FRONT, midnight + 1 + i, 100.0, 4) for i in range(3)]
+    for day in DAYS.days[1:]:
+        records += [_record(FRONT, day.start_unix + 1 + i, 100.0, 4) for i in range(3)]
+    return write_dbn(
+        tmp_path / "nq.dbn",
+        records,
+        declared_start_unix=midnight,
+        declared_end_unix=midnight + 2 * 86_400,
+        **header,
+    )
+
+
+def test_ingest_keeps_the_range_its_archive_declares(tmp_path: Path) -> None:
+    midnight = DAYS.days[0].start_unix + 2 * 3600
+    ingest_dbn(utc_bounded_download(tmp_path), tmp_path / "lake", SID, Timeframe.S1, DAYS)
+    declared = (midnight * NS, (midnight + 2 * 86_400) * NS)
+    assert [
+        source_range(session_path(tmp_path / "lake", SID, Timeframe.S1, label)) for label in LABELS
+    ] == [declared] * 3
+    # A record limit vouches for none of the range.
+    ingest_dbn(
+        utc_bounded_download(tmp_path, limit=9), tmp_path / "limited", SID, Timeframe.S1, DAYS
+    )
+    limited = session_path(tmp_path / "limited", SID, Timeframe.S1, LABELS[1])
+    assert source_range(limited) is None
+
+
+def test_volume_bars_are_only_built_from_sessions_the_download_covers_in_full(
+    tmp_path: Path,
+) -> None:
+    lake = tmp_path / "lake"
+    ingest_dbn(utc_bounded_download(tmp_path), lake, SID, Timeframe.S1, DAYS)
+    assert stored_labels(lake, SID, Timeframe.S1) == LABELS
+    spec = VolumeSpec(10, "ohlcv-1s")
+    for options in ({}, {"resume": True}, {"dry_run": True}):
+        with pytest.raises(ValueError, match="do not cover 2 requested session") as refused:
+            derive_volume(lake, SID, spec, DAYS, **options)
+        assert LABELS[0] in str(refused.value) and LABELS[2] in str(refused.value)
+        assert f"{LABELS[1]}:" not in str(refused.value)
+    # Not even the whole session in between was built on the way to the refusal.
+    assert not (lake / "event_bars").exists()
+    inside = eth_session_days([LABELS[1]])
+    (report,) = derive_volume(lake, SID, spec, inside)
+    assert (report["status"], report["volume"]) == ("written", 12)
+    assert [row["status"] for row in volume_coverage(lake, SID, spec, inside)] == ["valid"]
 
 
 def test_a_dry_run_reports_without_writing(tmp_path: Path) -> None:

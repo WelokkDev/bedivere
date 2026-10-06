@@ -28,7 +28,13 @@ import duckdb
 
 from bedivere.core.types import Candle, Timeframe
 from bedivere.data.lake.layout import SeriesId, session_path, stored_labels
-from bedivere.data.lake.schema import BAR_SELECT, BarBatch, check_described_schema
+from bedivere.data.lake.schema import (
+    BAR_SELECT,
+    META_SOURCE_END_NS,
+    META_SOURCE_START_NS,
+    BarBatch,
+    check_described_schema,
+)
 
 
 class LakeMissingError(Exception):
@@ -164,6 +170,17 @@ def partition_kv(path: Path) -> dict[str, str]:
         f"SELECT decode(key), decode(value) FROM parquet_kv_metadata({_sql_path(path)})"
     ).fetchall()
     return {str(k): str(v) for k, v in rows}
+
+
+def source_range(path: Path) -> tuple[int, int] | None:
+    """The `[start, end)` Unix-nanosecond range the partition's source declared
+    it covered, or None when its footer records none."""
+    meta = partition_kv(path)
+    try:
+        start, end = int(meta[META_SOURCE_START_NS]), int(meta[META_SOURCE_END_NS])
+    except (KeyError, ValueError):
+        return None
+    return (start, end) if 0 <= start < end else None
 
 
 def partition_row_count(path: Path) -> int:

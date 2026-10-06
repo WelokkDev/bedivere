@@ -8,7 +8,7 @@ and the lake must not invent bars for buckets the vendor never printed.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -17,9 +17,11 @@ from tests.lake_support import SKIP_REASON
 pytest.importorskip("duckdb", reason=SKIP_REASON)
 pytest.importorskip("pandas", reason=SKIP_REASON)
 
+from bedivere.cli import data as data_cli  # noqa: E402
 from bedivere.core.session_days import SessionDay  # noqa: E402
 from bedivere.core.types import Candle, Timeframe  # noqa: E402
 from bedivere.data.lake.layout import RollRule, continuous, session_path  # noqa: E402
+from bedivere.data.lake.query import COVERAGE_SQL, connect  # noqa: E402
 from bedivere.data.lake.read import (  # noqa: E402
     LakeMissingError,
     latest_stored_ts,
@@ -28,6 +30,7 @@ from bedivere.data.lake.read import (  # noqa: E402
     read_bars,
     read_table,
     roll_boundaries,
+    source_range,
 )
 from bedivere.data.lake.resample import (  # noqa: E402
     ResampleError,
@@ -36,7 +39,11 @@ from bedivere.data.lake.resample import (  # noqa: E402
     resample_table,
 )
 from bedivere.data.lake.schema import AS_TRADED, BarBatch, BarSchemaError  # noqa: E402
-from bedivere.data.lake.writer import LakeWriteError, write_day  # noqa: E402
+from bedivere.data.lake.writer import (  # noqa: E402
+    LakeWriteError,
+    source_range_metadata,
+    write_day,
+)
 from tests.helpers import eth_session_days  # noqa: E402
 from tests.lake_helpers import lake_table, ramp, rows_of  # noqa: E402
 
@@ -107,6 +114,34 @@ def test_footer_answers_without_reading_bars(tmp_path: Path) -> None:
     assert latest_stored_ts(tmp_path, SID, Timeframe.M5) is None
 
 
+def test_sql_answers_on_a_lake_that_holds_no_bars_or_only_time_bars(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    views = ("bars", "volume_bars", "condition")
+
+    def columns(con: Any, view: str) -> list[tuple[str, str]]:
+        return [(str(row[0]), str(row[1])) for row in con.execute(f"DESCRIBE {view}").fetchall()]
+
+    # Nothing stored at all: every view exists, empty, and the default query runs.
+    with connect(tmp_path / "empty") as con:
+        assert [con.execute(f"SELECT count(*) FROM {view}").fetchone() for view in views] == [(0,)] * 3
+        assert con.execute(COVERAGE_SQL).fetchall() == []
+        empty = {view: columns(con, view) for view in views}
+    # Time bars and no volume bars, which is every lake before `volume` is run.
+    write_day(tmp_path, SID, Timeframe.S1, DAY.label, lake_table(ramp(DAY.start_unix + 1, 6)), "t")
+    with connect(tmp_path) as con:
+        assert con.execute("SELECT count(*) FROM bars").fetchone() == (6,)
+        assert con.execute("SELECT count(*), sum(volume) FROM volume_bars").fetchone() == (0, None)
+        assert con.execute("SELECT count(*) FROM volume_bars WHERE close > open").fetchone() == (0,)
+        assert len(con.execute(COVERAGE_SQL).fetchall()) == 1
+        # The empty stand-in has the stored view's columns, order and types.
+        assert columns(con, "bars") == empty["bars"]
+    for root in (tmp_path / "empty", tmp_path):
+        assert data_cli.main(["sql", "--root", str(root)]) == 0
+        assert data_cli.main(["sql", "--root", str(root), "SELECT session FROM volume_bars"]) == 0
+    assert "Error" not in capsys.readouterr().err
+
+
 # ---------- the write seam ----------
 
 
@@ -122,6 +157,22 @@ def test_write_day_stamps_provenance_in_the_footer(tmp_path: Path) -> None:
     assert kv["bedivere.timeframe"] == "1s"
     assert kv["bedivere.session"] == DAY.label
     assert kv["bedivere.price_basis"] == AS_TRADED
+
+
+def test_a_source_range_is_kept_only_when_one_is_recorded(tmp_path: Path) -> None:
+    path = session_path(tmp_path, SID, Timeframe.S1, DAY.label)
+    rows = lake_table(ramp(DAY.start_unix + 1, 3))
+    write_day(tmp_path, SID, Timeframe.S1, DAY.label, rows, "src.dbn.zst")
+    assert source_range(path) is None  # the bars alone claim no coverage
+    start, end = DAY.start_unix * 10**9, DAY.end_unix * 10**9 + 7
+    write_day(
+        tmp_path, SID, Timeframe.S1, DAY.label, rows, "src.dbn.zst",
+        source_range_metadata(start, end),
+    )
+    assert source_range(path) == (start, end)  # nanoseconds, exactly
+    for bounds in ((end, start), (start, start), (-1, end), (start, 2**63)):
+        with pytest.raises(LakeWriteError, match="integer Unix nanoseconds with start < end"):
+            source_range_metadata(*bounds)
 
 
 def test_extra_metadata_cannot_relabel_a_partition(tmp_path: Path) -> None:

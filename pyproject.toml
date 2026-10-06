@@ -56,6 +56,7 @@ include = [
     "/src/bedivere",
     "/tests",
     "/examples",
+    "/docs",
     "/conftest.py",
     "/README.md",
     "/LICENSE",
@@ -75,6 +76,8 @@ ignore = ["E501"]
 
 [tool.pyright]
 include = ["src", "tests", "examples"]
+# Editors may not auto-search src/; bedivere then resolves through the venv as an untyped library.
+extraPaths = ["src"]
 typeCheckingMode = "strict"
 pythonVersion = "3.12"
 venvPath = "."
